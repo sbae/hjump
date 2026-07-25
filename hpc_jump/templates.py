@@ -31,6 +31,11 @@ identity_file = "C:/Users/your_windows_username/.ssh/id_ed25519"
 # This is the name VS Code connects to after hjump resolves the compute node.
 ssh_alias = "hpc-cpu-short"
 
+# Optional project folder opened automatically in VS Code.
+# Leave this unset by default so VS Code can restore its previous remote window/folder.
+# Uncomment to always open a specific folder.
+# remote_project_path = "/home/your_username/project"
+
 # Default Slurm partition/queue.
 default_partition = "cpu_short"
 
@@ -59,7 +64,4 @@ job_name_prefix = "hjump"
 # Experimental: reuse an existing RUNNING hjump Slurm job instead of requesting a new allocation.
 # This reuses the Slurm allocation/node, not your prior shell state.
 auto_reuse = true
-
-# Optional project folder opened automatically in VS Code.
-remote_project_path = "/home/your_username"
 '''
