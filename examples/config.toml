@@ -23,7 +23,9 @@ user = "your_username"
 identity_file = "C:/Users/your_windows_username/.ssh/id_ed25519"
 
 # Optional project folder opened automatically in VS Code.
-remote_project_path = "/home/your_username"
+# Leave this unset by default so VS Code can restore its previous remote window/folder.
+# Uncomment to always open a specific folder.
+# remote_project_path = "/home/your_username/project"
 
 # Default Slurm partition/queue.
 default_partition = "cpu_short"
