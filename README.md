@@ -78,7 +78,7 @@ Using Homebrew and pipx:
 ```bash
 brew install pipx
 pipx ensurepath
-pipx install git+https://github.com/sbae/hpc-jump.git
+pipx install git+https://github.com/sbae/hjump.git
 ```
 
 Verify:
@@ -98,7 +98,7 @@ Ubuntu/Debian:
 ```bash
 sudo apt install pipx
 pipx ensurepath
-pipx install git+https://github.com/sbae/hpc-jump.git
+pipx install git+https://github.com/sbae/hjump.git
 ```
 
 Generic Python install:
@@ -106,7 +106,7 @@ Generic Python install:
 ```bash
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install git+https://github.com/sbae/hpc-jump.git
+pipx install git+https://github.com/sbae/hjump.git
 ```
 
 Verify:
