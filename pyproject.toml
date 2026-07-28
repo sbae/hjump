@@ -13,6 +13,11 @@ dependencies = [
   "rich>=13.7",
 ]
 
+[project.urls]
+Homepage = "https://github.com/sbae/hjump"
+Repository = "https://github.com/sbae/hjump"
+Issues = "https://github.com/sbae/hjump/issues"
+
 [project.scripts]
 hjump = "hpc_jump.cli:app"
 
