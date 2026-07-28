@@ -59,7 +59,7 @@ py -m pipx ensurepath
 Restart PowerShell, then install:
 
 ```powershell
-pipx install git+https://github.com/sbae/hpc-jump.git
+pipx install git+https://github.com/sbae/hjump.git
 ```
 
 Verify:
