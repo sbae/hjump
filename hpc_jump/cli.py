@@ -147,7 +147,7 @@ def go(
     else:
         job = None
         if cluster.auto_reuse and not no_reuse:
-            console.print("Looking for reusable running Slurm job...")
+            console.print("Connecting to login node and checking for reusable Slurm jobs...")
             job = find_reusable_job(cluster, partition=part)
 
         if job is None:
