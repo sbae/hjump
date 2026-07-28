@@ -46,7 +46,7 @@ salloc_extra = []
 
 # Optional command run before every remote Slurm command.
 # Uncomment when your cluster requires Slurm to be loaded as a module.
-# remote_init = "module load slurm"
+remote_init = "module load slurm"
 
 # Slurm job name used for hjump-created sessions.
 # auto_reuse only considers RUNNING jobs with this exact Slurm job name.
