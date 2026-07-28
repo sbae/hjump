@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from functools import wraps
 from pathlib import Path
 from typing import Callable
-from functools import wraps
 
 import typer
 from rich.console import Console
@@ -21,7 +21,7 @@ from .diag import (
     check_vscode_remote_ssh,
     platform_summary,
 )
-from .slurm import allocate_job, cancel_job, find_reusable_job, resolve_job, run_login, set_ssh_verbose, wait_for_node
+from .slurm import SlurmJob, allocate_job, cancel_job, find_reusable_job, resolve_job, run_login, set_ssh_verbose, wait_for_node
 from .ssh_config import DEFAULT_SSH_CONFIG, update_ssh_config
 from .vscode import launch_vscode, open_in_vscode
 
@@ -55,6 +55,22 @@ def resolve_remote_directory(cluster: ClusterConfig, directory: str | None) -> s
     return home if directory == "~" else home.rstrip("/") + directory[1:]
 
 
+def _format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _print_pending_progress(job: SlurmJob, elapsed: float) -> None:
+    console.print(
+        f"Job {job.job_id} pending: [bold]{job.reason or 'unknown'}[/bold] "
+        f"(elapsed {_format_elapsed(elapsed)})"
+    )
+
+
 @app.command()
 def init(
     cluster_name: str = typer.Argument("my-hpc", help="Cluster profile name to create."),
@@ -71,10 +87,10 @@ def init(
     console.print(f"Created config template: [bold]{path}[/bold]")
     try:
         open_in_vscode(path)
-        console.print("Opening config in VS Code — fill in [bold]login_host[/bold], [bold]user[/bold], and [bold]remote_project_path[/bold], then run [bold]hjump go[/bold].")
+        console.print("Opening config in VS Code — fill in [bold]login_host[/bold] and [bold]user[/bold], then run [bold]hjump go[/bold].")
     except FileNotFoundError:
         console.print(f"Open this file to configure: [bold]{path}[/bold]")
-        console.print("Fill in [bold]login_host[/bold], [bold]user[/bold], and [bold]remote_project_path[/bold], then run [bold]hjump go[/bold].")
+        console.print("Fill in [bold]login_host[/bold] and [bold]user[/bold], then run [bold]hjump go[/bold].")
 
 
 @app.command("config")
@@ -105,6 +121,7 @@ def go(
     ssh_config: Path = typer.Option(DEFAULT_SSH_CONFIG, "--ssh-config", help="Path to SSH config."),
     directory: str | None = typer.Option(None, "--dir", help="Remote directory to open in VS Code."),
     wait_timeout: int = typer.Option(3600, "--wait-timeout", help="Seconds to wait for a new allocation."),
+    keep_failed_job: bool = typer.Option(False, "--keep-failed-job", help="Do not cancel a newly submitted job with a fatal pending reason."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Print OpenSSH diagnostic output."),
 ) -> None:
     """Allocate a Slurm job (or reuse one) and open VS Code on the compute node."""
@@ -120,7 +137,13 @@ def go(
         console.print(f"Attaching to existing Slurm job {existing_job}...")
         job = resolve_job(cluster, existing_job)
         if not job.node:
-            job = wait_for_node(cluster, existing_job, timeout_seconds=wait_timeout)
+            job = wait_for_node(
+                cluster,
+                existing_job,
+                timeout_seconds=wait_timeout,
+                on_progress=_print_pending_progress,
+                cancel_fatal=False,
+            )
     else:
         job = None
         if cluster.auto_reuse and not no_reuse:
@@ -129,6 +152,14 @@ def go(
 
         if job is None:
             console.print("Requesting new Slurm allocation...")
+            console.print(f"  Partition: {part or '(cluster default)'}")
+            console.print(f"  Time: {tlim}")
+            console.print(f"  CPUs: {ncpus}")
+            console.print(f"  Memory: {memory}")
+            console.print(f"  Job name: {cluster.job_name_prefix}")
+            if cluster.salloc_extra:
+                console.print(f"  Extra flags: {' '.join(cluster.salloc_extra)}")
+
             job_id = allocate_job(
                 cluster=cluster,
                 partition=part,
@@ -138,11 +169,17 @@ def go(
                 extra=cluster.salloc_extra,
                 timeout_seconds=wait_timeout,
             )
-            console.print(f"Allocated/submitted job {job_id}; waiting for compute node...")
-            job = wait_for_node(cluster, job_id, timeout_seconds=wait_timeout)
+            console.print(f"Submitted Slurm job {job_id}; waiting for compute node...")
+            job = wait_for_node(
+                cluster,
+                job_id,
+                timeout_seconds=wait_timeout,
+                on_progress=_print_pending_progress,
+                cancel_fatal=not keep_failed_job,
+            )
 
     if not job.node:
-        raise typer.Exit("No compute node available for selected job.")
+        raise RuntimeError("No compute node available for selected job.")
 
     update_ssh_config(cluster, job.node, ssh_config)
     console.print(f"SSH alias [bold]{cluster.effective_ssh_alias}[/bold] now points to {job.node}")
@@ -180,9 +217,9 @@ def attach(
     cluster = load_cluster(cluster_name, config)
     job = resolve_job(cluster, job_id)
     if not job.node:
-        job = wait_for_node(cluster, job_id)
+        job = wait_for_node(cluster, job_id, on_progress=_print_pending_progress, cancel_fatal=False)
     if not job.node:
-        raise typer.Exit("No compute node available for selected job.")
+        raise RuntimeError("No compute node available for selected job.")
     update_ssh_config(cluster, job.node, ssh_config)
     console.print(f"Attached {cluster.effective_ssh_alias} to {job.node}")
     if not no_launch:
