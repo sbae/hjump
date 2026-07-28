@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .config import ClusterConfig
 
@@ -17,6 +17,22 @@ _SSH_VERBOSE = False
 _OUTPUT_START = "__HPC_JUMP_OUTPUT_START__"
 _OUTPUT_END = "__HPC_JUMP_OUTPUT_END__"
 
+FATAL_PENDING_REASONS = {
+    "PartitionTimeLimit",
+    "PartitionNodeLimit",
+    "QOSMaxWallDurationPerJobLimit",
+    "InvalidAccount",
+    "InvalidQOS",
+    "BadConstraints",
+}
+LIMIT_PENDING_REASONS = {
+    "QOSMaxJobsPerUserLimit",
+    "QOSGrpJobsLimit",
+    "AssocMaxJobsLimit",
+    "AssocGrpJobsLimit",
+    "QOSMaxSubmitJobPerUserLimit",
+}
+
 
 @dataclass(frozen=True)
 class SlurmJob:
@@ -24,6 +40,14 @@ class SlurmJob:
     state: str
     node: str | None = None
     name: str | None = None
+    reason: str | None = None
+
+
+class PendingJobError(RuntimeError):
+    def __init__(self, job: SlurmJob, message: str, cancelled: bool = False) -> None:
+        super().__init__(message)
+        self.job = job
+        self.cancelled = cancelled
 
 
 def _ssh_target(cluster: ClusterConfig) -> str:
@@ -52,14 +76,11 @@ def run_login(
     check: bool = True,
     timeout: int = DEFAULT_SSH_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    # SSH runs commands in a non-login shell, which commonly has a reduced PATH
-    # on HPC systems. Use a login shell so site Slurm setup is loaded. Sites that
-    # require an environment module can provide remote_init in the cluster config.
     init = f"{cluster.remote_init} || exit $?; " if cluster.remote_init else ""
     framed_command = (
-        f"{init}printf '{_OUTPUT_START}\\n'; "
+        f"{init}printf '{_OUTPUT_START}\n'; "
         f"{command}; status=$?; "
-        f"printf '\\n{_OUTPUT_END}\\n'; exit $status"
+        f"printf '\n{_OUTPUT_END}\n'; exit $status"
     )
     remote_command = f"bash -lc {shlex.quote(framed_command)}"
     proc = subprocess.run(
@@ -79,8 +100,6 @@ def run_login(
     if _SSH_VERBOSE and proc.stderr:
         print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
 
-    # Login profiles sometimes print greetings. Only expose output produced by
-    # the requested command so those messages cannot corrupt Slurm parsers.
     if _OUTPUT_START in proc.stdout and _OUTPUT_END in proc.stdout:
         stdout = proc.stdout.rsplit(_OUTPUT_START, 1)[1].split(_OUTPUT_END, 1)[0]
         stdout = stdout.removeprefix("\r\n").removeprefix("\n").removesuffix("\r\n").removesuffix("\n")
@@ -103,25 +122,38 @@ def _first_host_from_nodelist(cluster: ClusterConfig, nodelist: str) -> str | No
 
 
 def resolve_job(cluster: ClusterConfig, job_id: str) -> SlurmJob:
-    fmt = "%i|%T|%N|%j"
+    fmt = "%i|%T|%N|%j|%r"
     cmd = f"squeue -j {shlex.quote(job_id)} -h -o {shlex.quote(fmt)}"
     out = run_login(cluster, cmd).stdout.strip()
     if not out:
         raise RuntimeError(f"No active Slurm job found with id {job_id}")
 
     line = out.splitlines()[0]
-    parts = line.split("|", 3)
-    if len(parts) != 4:
+    parts = line.split("|", 4)
+    if len(parts) != 5:
         raise RuntimeError(f"Could not parse squeue output: {line}")
 
-    job, state, nodelist, name = parts
-    return SlurmJob(job_id=job, state=state, node=_first_host_from_nodelist(cluster, nodelist), name=name)
+    job, state, nodelist, name, reason = parts
+    return SlurmJob(
+        job_id=job,
+        state=state,
+        node=_first_host_from_nodelist(cluster, nodelist),
+        name=name,
+        reason=None if reason in {"", "None", "(null)", "N/A"} else reason,
+    )
 
 
 def find_reusable_job(cluster: ClusterConfig, partition: str | None = None) -> SlurmJob | None:
     fmt = "%i|%T|%P|%N|%j"
     cmd = f"squeue -u $USER -h -t RUNNING -o {shlex.quote(fmt)}"
-    out = run_login(cluster, cmd, check=False).stdout.strip()
+    proc = run_login(cluster, cmd, check=False)
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "no diagnostic output"
+        raise RuntimeError(
+            "Could not check for reusable Slurm jobs because the remote SSH command failed. "
+            f"Exit code={proc.returncode}.\n{detail}"
+        )
+    out = proc.stdout.strip()
     if not out:
         return None
 
@@ -168,25 +200,70 @@ def allocate_job(
     if match:
         return match.group(1)
 
+    if proc.returncode == 255:
+        raise RuntimeError(
+            "SSH connection to the HPC login node failed before Slurm could allocate a job. "
+            f"Target={_ssh_target(cluster)} port={cluster.port}.\n"
+            f"SSH stderr: {proc.stderr.strip() or '(empty)'}"
+        )
     raise RuntimeError(
-        "Could not allocate a Slurm job or determine its id. "
-        f"remote exit code={proc.returncode}. "
+        "Slurm allocation failed or its job id could not be parsed. "
+        f"Remote exit code={proc.returncode}. "
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
 
 
-def wait_for_node(cluster: ClusterConfig, job_id: str, poll_seconds: float = 3.0, timeout_seconds: int = 3600) -> SlurmJob:
-    deadline = time.time() + timeout_seconds
+def wait_for_node(
+    cluster: ClusterConfig,
+    job_id: str,
+    poll_seconds: float = 3.0,
+    timeout_seconds: int = 3600,
+    on_progress: Callable[[SlurmJob, float], None] | None = None,
+    cancel_fatal: bool = True,
+) -> SlurmJob:
+    started = time.monotonic()
+    deadline = started + timeout_seconds
     last: SlurmJob | None = None
-    while time.time() < deadline:
+    last_reason: str | None = None
+    last_report = started
+
+    while time.monotonic() < deadline:
         job = resolve_job(cluster, job_id)
         last = job
+        elapsed = time.monotonic() - started
         if job.state == "RUNNING" and job.node:
             return job
         if job.state in {"FAILED", "CANCELLED", "TIMEOUT", "COMPLETED"}:
             raise RuntimeError(f"Job {job_id} ended before a node was available: {job.state}")
+
+        reason = job.reason
+        if reason in FATAL_PENDING_REASONS or reason in LIMIT_PENDING_REASONS:
+            cancelled = False
+            if cancel_fatal:
+                cancel_job(cluster, job_id)
+                cancelled = True
+            category = "request is invalid for this partition/QOS" if reason in FATAL_PENDING_REASONS else "account or QOS limit has been reached"
+            action = "The pending job was cancelled." if cancelled else "The pending job was left in the queue."
+            raise PendingJobError(
+                job,
+                f"Slurm job {job_id} cannot start: {reason}. The {category}. {action}",
+                cancelled=cancelled,
+            )
+
+        now = time.monotonic()
+        if on_progress and (reason != last_reason or now - last_report >= 30):
+            on_progress(job, elapsed)
+            last_reason = reason
+            last_report = now
         time.sleep(poll_seconds)
-    raise TimeoutError(f"Timed out waiting for job {job_id}. Last status: {last}")
+
+    elapsed = time.monotonic() - started
+    reason = last.reason if last else None
+    state = last.state if last else "unknown"
+    raise TimeoutError(
+        f"Timed out after {elapsed:.0f}s waiting for Slurm job {job_id}. "
+        f"Current state={state}; pending reason={reason or 'unknown'}. The job was left pending."
+    )
 
 
 def cancel_job(cluster: ClusterConfig, job_id: str) -> None:
