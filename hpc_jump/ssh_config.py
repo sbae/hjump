@@ -70,7 +70,13 @@ def render_login_block(cluster: ClusterConfig) -> str:
 def render_host_block(cluster: ClusterConfig, compute_node: str) -> str:
     start, end = _markers(cluster.name)
     identity_file = _identity_file(cluster)
-    lines = [start, *_render_login_host(cluster), "", f"Host {cluster.effective_ssh_alias}", f"    HostName {compute_node}"]
+    lines = [
+        start,
+        *_render_login_host(cluster),
+        "",
+        f"Host {cluster.effective_ssh_alias}",
+        f"    HostName {compute_node}",
+    ]
     if cluster.user:
         lines.append(f"    User {cluster.user}")
     if identity_file:
@@ -104,6 +110,34 @@ def _replace_managed_block(existing: str, cluster: ClusterConfig, block: str) ->
     return existing.rstrip() + "\n\n" + block
 
 
+def _extract_compute_node(managed: str, alias: str) -> str | None:
+    """Return HostName from the last exact managed compute-host stanza.
+
+    Exact line matching matters because an alias such as ``uv`` is also a
+    substring of the generated login alias ``uv-login``. Choosing the last
+    exact stanza also repairs blocks corrupted by the older substring parser.
+    """
+    lines = managed.splitlines()
+    expected_host = f"host {alias}".casefold()
+    host_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip().casefold() == expected_host
+    ]
+
+    for host_index in reversed(host_indexes):
+        for line in lines[host_index + 1 :]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.casefold().startswith("host "):
+                break
+            key, separator, value = stripped.partition(" ")
+            if separator and key.casefold() == "hostname" and value.strip():
+                return value.strip()
+    return None
+
+
 def _write_config(path: Path, content: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -111,20 +145,21 @@ def _write_config(path: Path, content: str) -> None:
 
 
 def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> None:
-    """Create or refresh the managed login alias without discarding a compute alias."""
+    """Create or refresh the login alias and repair its managed block."""
     path = path.expanduser()
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     start, end = _markers(cluster.name)
 
-    compute_lines: list[str] = []
+    compute_node = None
     if start in existing and end in existing:
         managed = existing.split(start, 1)[1].split(end, 1)[0]
-        compute_marker = f"Host {cluster.effective_ssh_alias}"
-        if compute_marker in managed:
-            tail = managed.split(compute_marker, 1)[1].strip("\r\n")
-            compute_lines = ["", compute_marker, *tail.splitlines()]
+        compute_node = _extract_compute_node(managed, cluster.effective_ssh_alias)
 
-    block = "\n".join([start, *_render_login_host(cluster), *compute_lines, end, ""])
+    block = (
+        render_host_block(cluster, compute_node)
+        if compute_node
+        else render_login_block(cluster)
+    )
     _write_config(path, _replace_managed_block(existing, cluster, block))
 
 
