@@ -13,9 +13,20 @@ from .config import ClusterConfig
 
 DEFAULT_SSH_TIMEOUT_SECONDS = 60
 DEFAULT_ALLOCATION_TIMEOUT_SECONDS = 3600
+DEFAULT_SSH_ATTEMPTS = 3
+SSH_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 _SSH_VERBOSE = False
 _OUTPUT_START = "__HPC_JUMP_OUTPUT_START__"
 _OUTPUT_END = "__HPC_JUMP_OUTPUT_END__"
+_TRANSIENT_SSH_MARKERS = (
+    "banner exchange",
+    "kex_exchange_identification",
+    "connection reset",
+    "connection refused",
+    "connection closed by remote host",
+    "connection timed out",
+    "connection aborted",
+)
 
 FATAL_PENDING_REASONS = {
     "PartitionTimeLimit",
@@ -51,9 +62,7 @@ class PendingJobError(RuntimeError):
 
 
 def _ssh_target(cluster: ClusterConfig) -> str:
-    if cluster.user:
-        return f"{cluster.user}@{cluster.login_host}"
-    return cluster.login_host
+    return f"{cluster.user}@{cluster.login_host}" if cluster.user else cluster.login_host
 
 
 def _ssh_args(cluster: ClusterConfig) -> list[str]:
@@ -70,40 +79,72 @@ def set_ssh_verbose(enabled: bool) -> None:
     _SSH_VERBOSE = enabled
 
 
+def _is_transient_ssh_failure(proc: subprocess.CompletedProcess[str]) -> bool:
+    text = proc.stderr.lower()
+    return proc.returncode == 255 and any(marker in text for marker in _TRANSIENT_SSH_MARKERS)
+
+
+def _brief_ssh_failure(proc: subprocess.CompletedProcess[str]) -> str:
+    lines = [line.strip() for line in proc.stderr.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if any(marker in line.lower() for marker in _TRANSIENT_SSH_MARKERS):
+            return line
+    return lines[-1] if lines else "SSH connection failed"
+
+
 def run_login(
     cluster: ClusterConfig,
     command: str,
     check: bool = True,
     timeout: int = DEFAULT_SSH_TIMEOUT_SECONDS,
+    attempts: int = DEFAULT_SSH_ATTEMPTS,
 ) -> subprocess.CompletedProcess[str]:
     init = f"{cluster.remote_init} || exit $?; " if cluster.remote_init else ""
-    framed_command = (
-        f"{init}printf '{_OUTPUT_START}\n'; "
-        f"{command}; status=$?; "
+    framed = (
+        f"{init}printf '{_OUTPUT_START}\n'; {command}; status=$?; "
         f"printf '\n{_OUTPUT_END}\n'; exit $status"
     )
-    remote_command = f"bash -lc {shlex.quote(framed_command)}"
-    proc = subprocess.run(
-        [
-            *_ssh_args(cluster),
-            "-o",
-            f"ConnectTimeout={min(timeout, DEFAULT_SSH_TIMEOUT_SECONDS)}",
-            _ssh_target(cluster),
-            remote_command,
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
-    )
-    if _SSH_VERBOSE and proc.stderr:
-        print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
+    remote_command = f"bash -lc {shlex.quote(framed)}"
+    attempts = max(1, attempts)
+
+    for attempt in range(1, attempts + 1):
+        proc = subprocess.run(
+            [
+                *_ssh_args(cluster),
+                "-o",
+                f"ConnectTimeout={min(timeout, DEFAULT_SSH_TIMEOUT_SECONDS)}",
+                _ssh_target(cluster),
+                remote_command,
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+
+        if _SSH_VERBOSE and proc.stderr:
+            print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
+
+        if not _is_transient_ssh_failure(proc) or attempt == attempts:
+            if attempt > 1 and proc.returncode == 0:
+                print(f"SSH connection succeeded on attempt {attempt}/{attempts}.", file=sys.stderr)
+            break
+
+        delay = SSH_RETRY_DELAYS_SECONDS[min(attempt - 1, len(SSH_RETRY_DELAYS_SECONDS) - 1)]
+        print(
+            f"SSH handshake failed before authentication (attempt {attempt}/{attempts}): "
+            f"{_brief_ssh_failure(proc)}",
+            file=sys.stderr,
+        )
+        print(f"Retrying SSH connection in {delay:g} second(s)...", file=sys.stderr)
+        time.sleep(delay)
 
     if _OUTPUT_START in proc.stdout and _OUTPUT_END in proc.stdout:
         stdout = proc.stdout.rsplit(_OUTPUT_START, 1)[1].split(_OUTPUT_END, 1)[0]
         stdout = stdout.removeprefix("\r\n").removeprefix("\n").removesuffix("\r\n").removesuffix("\n")
         proc = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, proc.stderr)
+
     if check and proc.returncode != 0:
         detail = "" if _SSH_VERBOSE else (proc.stderr.strip() or proc.stdout.strip())
         message = f"Remote SSH command failed with exit code {proc.returncode}."
@@ -116,23 +157,19 @@ def run_login(
 def _first_host_from_nodelist(cluster: ClusterConfig, nodelist: str) -> str | None:
     if not nodelist or nodelist in {"(null)", "None", "N/A"}:
         return None
-    cmd = f"scontrol show hostnames {shlex.quote(nodelist)} | head -n 1"
-    out = run_login(cluster, cmd).stdout.strip()
+    out = run_login(cluster, f"scontrol show hostnames {shlex.quote(nodelist)} | head -n 1").stdout.strip()
     return out or None
 
 
 def resolve_job(cluster: ClusterConfig, job_id: str) -> SlurmJob:
     fmt = "%i|%T|%N|%j|%r"
-    cmd = f"squeue -j {shlex.quote(job_id)} -h -o {shlex.quote(fmt)}"
-    out = run_login(cluster, cmd).stdout.strip()
+    out = run_login(cluster, f"squeue -j {shlex.quote(job_id)} -h -o {shlex.quote(fmt)}").stdout.strip()
     if not out:
         raise RuntimeError(f"No active Slurm job found with id {job_id}")
-
     line = out.splitlines()[0]
     parts = line.split("|", 4)
     if len(parts) != 5:
         raise RuntimeError(f"Could not parse squeue output: {line}")
-
     job, state, nodelist, name, reason = parts
     return SlurmJob(
         job_id=job,
@@ -148,23 +185,23 @@ def find_reusable_job(cluster: ClusterConfig, partition: str | None = None) -> S
     cmd = f"squeue -u $USER -h -t RUNNING -o {shlex.quote(fmt)}"
     proc = run_login(cluster, cmd, check=False)
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "no diagnostic output"
-        raise RuntimeError(
+        detail = "" if _SSH_VERBOSE else (proc.stderr.strip() or proc.stdout.strip())
+        message = (
             "Could not check for reusable Slurm jobs because the remote SSH command failed. "
-            f"Exit code={proc.returncode}.\n{detail}"
+            f"Exit code={proc.returncode}."
         )
-    out = proc.stdout.strip()
-    if not out:
+        if detail:
+            message = f"{message}\n{detail}"
+        raise RuntimeError(message)
+    if not proc.stdout.strip():
         return None
 
-    for line in out.splitlines():
+    for line in proc.stdout.splitlines():
         parts = line.split("|", 4)
         if len(parts) != 5:
             continue
         job_id, state, job_partition, nodelist, name = parts
-        if name != cluster.job_name_prefix:
-            continue
-        if partition and job_partition != partition:
+        if name != cluster.job_name_prefix or (partition and job_partition != partition):
             continue
         node = _first_host_from_nodelist(cluster, nodelist)
         if node:
@@ -193,23 +230,28 @@ def allocate_job(
         args.append(f"--partition={partition}")
     args.extend(extra or [])
 
-    remote_cmd = " ".join(shlex.quote(x) for x in args)
-    proc = run_login(cluster, remote_cmd, check=False, timeout=timeout_seconds)
+    proc = run_login(
+        cluster,
+        " ".join(shlex.quote(x) for x in args),
+        check=False,
+        timeout=timeout_seconds,
+    )
     combined = "\n".join([proc.stdout, proc.stderr])
     match = re.search(r"\b(?:Granted|Pending) job allocation (\d+)\b", combined)
     if match:
         return match.group(1)
 
     if proc.returncode == 255:
-        raise RuntimeError(
+        message = (
             "SSH connection to the HPC login node failed before Slurm could allocate a job. "
-            f"Target={_ssh_target(cluster)} port={cluster.port}.\n"
-            f"SSH stderr: {proc.stderr.strip() or '(empty)'}"
+            f"Target={_ssh_target(cluster)} port={cluster.port}."
         )
+        if not _SSH_VERBOSE:
+            message = f"{message}\nSSH stderr: {proc.stderr.strip() or '(empty)'}"
+        raise RuntimeError(message)
     raise RuntimeError(
         "Slurm allocation failed or its job id could not be parsed. "
-        f"Remote exit code={proc.returncode}. "
-        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        f"Remote exit code={proc.returncode}. stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
 
 
@@ -242,7 +284,11 @@ def wait_for_node(
             if cancel_fatal:
                 cancel_job(cluster, job_id)
                 cancelled = True
-            category = "request is invalid for this partition/QOS" if reason in FATAL_PENDING_REASONS else "account or QOS limit has been reached"
+            category = (
+                "request is invalid for this partition/QOS"
+                if reason in FATAL_PENDING_REASONS
+                else "account or QOS limit has been reached"
+            )
             action = "The pending job was cancelled." if cancelled else "The pending job was left in the queue."
             raise PendingJobError(
                 job,
