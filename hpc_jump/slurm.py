@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ DEFAULT_ALLOCATION_TIMEOUT_SECONDS = 3600
 DEFAULT_SSH_ATTEMPTS = 3
 SSH_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 _SSH_VERBOSE = False
+_SSH_CONFIG_PATH: Path | None = None
 _OUTPUT_START = "__HPC_JUMP_OUTPUT_START__"
 _OUTPUT_END = "__HPC_JUMP_OUTPUT_END__"
 _TRANSIENT_SSH_MARKERS = (
@@ -62,21 +64,53 @@ class PendingJobError(RuntimeError):
 
 
 def _ssh_target(cluster: ClusterConfig) -> str:
-    return f"{cluster.user}@{cluster.login_host}" if cluster.user else cluster.login_host
+    return f"{cluster.effective_ssh_alias}-login"
 
 
-def _ssh_args(cluster: ClusterConfig) -> list[str]:
-    args = ["ssh", "-p", str(cluster.port)]
+def _ssh_args(cluster: ClusterConfig, endpoint: str | None = None) -> list[str]:
+    args = ["ssh"]
+    if _SSH_CONFIG_PATH is not None:
+        args.extend(["-F", str(_SSH_CONFIG_PATH)])
     if _SSH_VERBOSE:
         args.append("-v")
-    if cluster.identity_file:
-        args.extend(["-i", str(Path(cluster.identity_file).expanduser())])
+    if endpoint:
+        args.extend(
+            [
+                "-o",
+                f"HostName={endpoint}",
+                "-o",
+                f"HostKeyAlias={cluster.login_host}",
+            ]
+        )
     return args
 
 
 def set_ssh_verbose(enabled: bool) -> None:
     global _SSH_VERBOSE
     _SSH_VERBOSE = enabled
+
+
+def set_ssh_config_path(path: Path | None) -> None:
+    global _SSH_CONFIG_PATH
+    _SSH_CONFIG_PATH = path.expanduser() if path is not None else None
+
+
+def _resolve_login_endpoints(cluster: ClusterConfig) -> list[str]:
+    try:
+        records = socket.getaddrinfo(
+            cluster.login_host,
+            cluster.port,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return []
+
+    endpoints: list[str] = []
+    for _family, _socktype, _proto, _canonname, sockaddr in records:
+        endpoint = str(sockaddr[0])
+        if endpoint not in endpoints:
+            endpoints.append(endpoint)
+    return endpoints
 
 
 def _is_transient_ssh_failure(proc: subprocess.CompletedProcess[str]) -> bool:
@@ -105,12 +139,21 @@ def run_login(
         f"printf '\n{_OUTPUT_END}\n'; exit $status"
     )
     remote_command = f"bash -lc {shlex.quote(framed)}"
-    attempts = max(1, attempts)
 
-    for attempt in range(1, attempts + 1):
+    endpoints = _resolve_login_endpoints(cluster)
+    total_attempts = max(1, attempts, len(endpoints))
+    candidates: list[str | None]
+    if endpoints:
+        candidates = [endpoints[index % len(endpoints)] for index in range(total_attempts)]
+    else:
+        candidates = [None] * total_attempts
+
+    proc: subprocess.CompletedProcess[str] | None = None
+    for index, endpoint in enumerate(candidates):
+        attempt = index + 1
         proc = subprocess.run(
             [
-                *_ssh_args(cluster),
+                *_ssh_args(cluster, endpoint),
                 "-o",
                 f"ConnectTimeout={min(timeout, DEFAULT_SSH_TIMEOUT_SECONDS)}",
                 _ssh_target(cluster),
@@ -126,19 +169,34 @@ def run_login(
         if _SSH_VERBOSE and proc.stderr:
             print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
 
-        if not _is_transient_ssh_failure(proc) or attempt == attempts:
+        if not _is_transient_ssh_failure(proc) or attempt == total_attempts:
             if attempt > 1 and proc.returncode == 0:
-                print(f"SSH connection succeeded on attempt {attempt}/{attempts}.", file=sys.stderr)
+                endpoint_text = f" via {endpoint}" if endpoint else ""
+                print(
+                    f"SSH connection succeeded on attempt {attempt}/{total_attempts}{endpoint_text}.",
+                    file=sys.stderr,
+                )
             break
 
-        delay = SSH_RETRY_DELAYS_SECONDS[min(attempt - 1, len(SSH_RETRY_DELAYS_SECONDS) - 1)]
+        next_endpoint = candidates[index + 1]
+        delay = SSH_RETRY_DELAYS_SECONDS[min(index, len(SSH_RETRY_DELAYS_SECONDS) - 1)]
+        endpoint_text = endpoint or cluster.login_host
         print(
-            f"SSH handshake failed before authentication (attempt {attempt}/{attempts}): "
-            f"{_brief_ssh_failure(proc)}",
+            f"SSH connection to login endpoint {endpoint_text} failed before authentication "
+            f"(attempt {attempt}/{total_attempts}): {_brief_ssh_failure(proc)}",
             file=sys.stderr,
         )
-        print(f"Retrying SSH connection in {delay:g} second(s)...", file=sys.stderr)
+        if next_endpoint and next_endpoint != endpoint:
+            print(
+                f"Trying next login endpoint {next_endpoint} in {delay:g} second(s)...",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Retrying SSH connection in {delay:g} second(s)...", file=sys.stderr)
         time.sleep(delay)
+
+    if proc is None:
+        raise RuntimeError("SSH command was not attempted.")
 
     if _OUTPUT_START in proc.stdout and _OUTPUT_END in proc.stdout:
         stdout = proc.stdout.rsplit(_OUTPUT_START, 1)[1].split(_OUTPUT_END, 1)[0]
@@ -244,7 +302,7 @@ def allocate_job(
     if proc.returncode == 255:
         message = (
             "SSH connection to the HPC login node failed before Slurm could allocate a job. "
-            f"Target={_ssh_target(cluster)} port={cluster.port}."
+            f"Target={_ssh_target(cluster)}."
         )
         if not _SSH_VERBOSE:
             message = f"{message}\nSSH stderr: {proc.stderr.strip() or '(empty)'}"
