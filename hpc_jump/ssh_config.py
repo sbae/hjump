@@ -22,7 +22,7 @@ def _identity_file(cluster: ClusterConfig) -> str | None:
     return str(Path(cluster.identity_file).expanduser())
 
 
-def _login_alias(cluster: ClusterConfig) -> str:
+def login_alias(cluster: ClusterConfig) -> str:
     return f"{cluster.effective_ssh_alias}-login"
 
 
@@ -35,8 +35,6 @@ def _secure_config_permissions(path: Path) -> None:
     username = os.environ.get("USERNAME") or getpass.getuser()
     principal = f"{domain}\\{username}" if domain else username
     commands = [
-        # Establish explicit access before removing inherited rules. If a later
-        # command fails, the user must not be locked out of their own config.
         ["icacls", str(path), "/grant:r", f"{principal}:(F)"],
         ["icacls", str(path), "/grant:r", "*S-1-5-18:(F)"],
         ["icacls", str(path), "/grant:r", "*S-1-5-32-544:(F)"],
@@ -50,54 +48,47 @@ def _secure_config_permissions(path: Path) -> None:
             raise RuntimeError(f"Could not secure SSH config permissions: {detail}")
 
 
-def render_host_block(cluster: ClusterConfig, compute_node: str) -> str:
-    identity_file = _identity_file(cluster)
-    login_alias = _login_alias(cluster)
-
+def _render_login_host(cluster: ClusterConfig) -> list[str]:
     lines = [
-        _markers(cluster.name)[0],
-        f"Host {login_alias}",
+        f"Host {login_alias(cluster)}",
         f"    HostName {cluster.login_host}",
         f"    Port {cluster.port}",
     ]
     if cluster.user:
         lines.append(f"    User {cluster.user}")
+    identity_file = _identity_file(cluster)
     if identity_file:
         lines.append(f"    IdentityFile {identity_file}")
+    return lines
 
-    lines.extend(
-        [
-            "",
-            f"Host {cluster.effective_ssh_alias}",
-            f"    HostName {compute_node}",
-        ]
-    )
+
+def render_login_block(cluster: ClusterConfig) -> str:
+    start, end = _markers(cluster.name)
+    return "\n".join([start, *_render_login_host(cluster), end, ""])
+
+
+def render_host_block(cluster: ClusterConfig, compute_node: str) -> str:
+    start, end = _markers(cluster.name)
+    identity_file = _identity_file(cluster)
+    lines = [start, *_render_login_host(cluster), "", f"Host {cluster.effective_ssh_alias}", f"    HostName {compute_node}"]
     if cluster.user:
         lines.append(f"    User {cluster.user}")
     if identity_file:
         lines.append(f"    IdentityFile {identity_file}")
     lines.extend(
         [
-            f"    ProxyJump {login_alias}",
+            f"    ProxyJump {login_alias(cluster)}",
             "    ServerAliveInterval 30",
             "    ServerAliveCountMax 3",
-            _markers(cluster.name)[1],
+            end,
             "",
         ]
     )
     return "\n".join(lines)
 
 
-def update_ssh_config(
-    cluster: ClusterConfig,
-    compute_node: str,
-    path: Path = DEFAULT_SSH_CONFIG,
-) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+def _replace_managed_block(existing: str, cluster: ClusterConfig, block: str) -> str:
     start, end = _markers(cluster.name)
-    block = render_host_block(cluster, compute_node)
-
     has_start = start in existing
     has_end = end in existing
     if has_start != has_end:
@@ -106,12 +97,43 @@ def update_ssh_config(
             "Please repair or remove the managed block markers before retrying."
         )
 
-    if has_start and has_end:
+    if has_start:
         before, rest = existing.split(start, 1)
         _, after = rest.split(end, 1)
-        updated = before.rstrip() + "\n\n" + block + after.lstrip()
-    else:
-        updated = existing.rstrip() + "\n\n" + block
+        return before.rstrip() + "\n\n" + block + after.lstrip()
+    return existing.rstrip() + "\n\n" + block
 
-    path.write_text(updated, encoding="utf-8")
+
+def _write_config(path: Path, content: str) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
     _secure_config_permissions(path)
+
+
+def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> None:
+    """Create or refresh the managed login alias without discarding a compute alias."""
+    path = path.expanduser()
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    start, end = _markers(cluster.name)
+
+    compute_lines: list[str] = []
+    if start in existing and end in existing:
+        managed = existing.split(start, 1)[1].split(end, 1)[0]
+        compute_marker = f"Host {cluster.effective_ssh_alias}"
+        if compute_marker in managed:
+            tail = managed.split(compute_marker, 1)[1].strip("\r\n")
+            compute_lines = ["", compute_marker, *tail.splitlines()]
+
+    block = "\n".join([start, *_render_login_host(cluster), *compute_lines, end, ""])
+    _write_config(path, _replace_managed_block(existing, cluster, block))
+
+
+def update_ssh_config(
+    cluster: ClusterConfig,
+    compute_node: str,
+    path: Path = DEFAULT_SSH_CONFIG,
+) -> None:
+    path = path.expanduser()
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    block = render_host_block(cluster, compute_node)
+    _write_config(path, _replace_managed_block(existing, cluster, block))
