@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hjump"
-version = "0.3.3"
+version = "0.3.4"
 description = "Open VS Code Remote-SSH on a Slurm compute node via ProxyJump."
 readme = "README.md"
 requires-python = ">=3.11"
