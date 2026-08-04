@@ -21,8 +21,18 @@ from .diag import (
     check_vscode_remote_ssh,
     platform_summary,
 )
-from .slurm import SlurmJob, allocate_job, cancel_job, find_reusable_job, resolve_job, run_login, set_ssh_verbose, wait_for_node
-from .ssh_config import DEFAULT_SSH_CONFIG, update_ssh_config
+from .slurm import (
+    SlurmJob,
+    allocate_job,
+    cancel_job,
+    find_reusable_job,
+    resolve_job,
+    run_login,
+    set_ssh_config_path,
+    set_ssh_verbose,
+    wait_for_node,
+)
+from .ssh_config import DEFAULT_SSH_CONFIG, ensure_login_ssh_config, update_ssh_config
 from .vscode import launch_vscode, open_in_vscode
 
 app = typer.Typer(no_args_is_help=True)
@@ -53,6 +63,13 @@ def resolve_remote_directory(cluster: ClusterConfig, directory: str | None) -> s
     if not home:
         raise RuntimeError("Could not determine the remote home directory.")
     return home if directory == "~" else home.rstrip("/") + directory[1:]
+
+
+def _configure_login_ssh(cluster: ClusterConfig, ssh_config: Path) -> Path:
+    path = ssh_config.expanduser()
+    ensure_login_ssh_config(cluster, path)
+    set_ssh_config_path(path)
+    return path
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -127,6 +144,7 @@ def go(
     """Allocate a Slurm job (or reuse one) and open VS Code on the compute node."""
     set_ssh_verbose(verbose)
     cluster = load_cluster(cluster_name, config)
+    ssh_config = _configure_login_ssh(cluster, ssh_config)
     part = partition if partition is not None else cluster.default_partition
     tlim = time_limit if time_limit is not None else cluster.default_time
     ncpus = cpus if cpus is not None else cluster.default_cpus
@@ -215,6 +233,7 @@ def attach(
 ) -> None:
     """Attach VS Code to an already-running Slurm job by job id."""
     cluster = load_cluster(cluster_name, config)
+    ssh_config = _configure_login_ssh(cluster, ssh_config)
     job = resolve_job(cluster, job_id)
     if not job.node:
         job = wait_for_node(cluster, job_id, on_progress=_print_pending_progress, cancel_fatal=False)
@@ -233,9 +252,11 @@ def cancel(
     cluster_name: str,
     job_id: str = typer.Option(..., "--job-id", help="Slurm job id to cancel."),
     config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config"),
+    ssh_config: Path = typer.Option(DEFAULT_SSH_CONFIG, "--ssh-config"),
 ) -> None:
     """Cancel a Slurm job by id."""
     cluster = load_cluster(cluster_name, config)
+    _configure_login_ssh(cluster, ssh_config)
     cancel_job(cluster, job_id)
     console.print(f"Cancelled Slurm job {job_id}")
 
@@ -279,9 +300,16 @@ def diag(
             results.append(type(results[0])("cluster profile", False, str(exc)))
 
     if cluster is not None and remote:
-        target = f"{cluster.user + '@' if cluster.user else ''}{cluster.login_host}:{cluster.port}"
+        try:
+            _configure_login_ssh(cluster, ssh_config)
+        except Exception as exc:
+            results.append(type(results[0])("managed login alias", False, str(exc)))
+            cluster = None
+
+    if cluster is not None and remote:
+        target = f"{cluster.effective_ssh_alias}-login"
         run_check(
-            f"SSH login to {target}",
+            f"SSH login through {target}",
             lambda: check_login_reachable(cluster, timeout=remote_timeout),
         )
         for command in ["squeue", "salloc", "scontrol", "scancel"]:
