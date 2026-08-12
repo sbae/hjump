@@ -71,7 +71,7 @@ class PendingJobError(RuntimeError):
 
 
 def _ssh_target(cluster: ClusterConfig) -> str:
-    return f"{cluster.effective_ssh_alias}-login"
+    return cluster.effective_login_alias
 
 
 def _ssh_args(cluster: ClusterConfig, endpoint: str | None = None) -> list[str]:
@@ -127,6 +127,29 @@ def resolve_login_endpoints(cluster: ClusterConfig) -> list[str]:
     return endpoints
 
 
+def discover_partitions(cluster: ClusterConfig) -> tuple[list[str], str | None]:
+    """Return visible Slurm partitions and the cluster-marked default partition."""
+    proc = run_login(cluster, "sinfo -h -o '%P'", check=False)
+    if proc.returncode != 0:
+        return [], None
+
+    partitions: list[str] = []
+    default_partition: str | None = None
+    for line in proc.stdout.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        is_default = raw.endswith("*")
+        name = raw.rstrip("*").strip()
+        if not name:
+            continue
+        if name not in partitions:
+            partitions.append(name)
+        if is_default and default_partition is None:
+            default_partition = name
+    return partitions, default_partition
+
+
 def _is_transient_ssh_failure(proc: subprocess.CompletedProcess[str]) -> bool:
     text = proc.stderr.lower()
     return proc.returncode == 255 and any(marker in text for marker in _TRANSIENT_SSH_MARKERS)
@@ -159,6 +182,10 @@ def run_login(
 
     if endpoint is not None:
         candidates: list[str | None] = [endpoint]
+    elif cluster.login_ssh_alias:
+        # An explicit existing alias may contain ProxyJump, certificates, MFA,
+        # ProxyCommand, or other routing. Do not override its HostName.
+        candidates = [None] * max(1, attempts)
     else:
         endpoints = resolve_login_endpoints(cluster)
         total_attempts = max(1, attempts, len(endpoints))
@@ -202,7 +229,7 @@ def run_login(
 
         next_endpoint = candidates[index + 1]
         delay = SSH_RETRY_DELAYS_SECONDS[min(index, len(SSH_RETRY_DELAYS_SECONDS) - 1)]
-        endpoint_text = candidate or cluster.login_host
+        endpoint_text = candidate or cluster.effective_login_alias
         print(
             f"Login endpoint {endpoint_text} unavailable (attempt {attempt}/{total_attempts}): "
             f"{_brief_ssh_failure(proc)}",
