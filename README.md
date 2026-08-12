@@ -1,214 +1,263 @@
-# hjump (aka hpc-jump)
+# hjump
 
-> You use a Slurm HPC cluster for work. You can't live without VS Code. Your admin hates you because VS Code
-> quietly spawns a server, file watchers, and a language server, all on the login node, and just won't stop.
->
-> Is this your story?
+Small CLI helper for opening VS Code Remote-SSH on a Slurm compute node instead of an HPC login node.
 
-Small CLI helper for opening VS Code Remote-SSH on a Slurm compute node instead of on an HPC login node.
+`hjump` uses the login node only for lightweight SSH/Slurm control commands. It allocates or discovers a compute job, maintains SSH aliases with `ProxyJump`, and opens VS Code on the assigned compute node.
 
-The intended workflow is:
+## The basic workflow
 
-1. Use SSH only to run lightweight Slurm commands on the login node.
-2. Allocate or discover an interactive Slurm job.
-3. Resolve the assigned compute node.
-4. Write a managed host entry in `~/.ssh/config` using `ProxyJump` through the login node.
-5. Launch VS Code against the compute node alias.
+```bash
+hjump init uv
+hjump go uv
+```
 
-This keeps the VS Code server, file watchers, terminals, and language servers off the login node.
+After setup, `hjump go <cluster>` is intended to be the normal user interface.
+
+Typical output:
+
+```text
+Connecting to uv...
+✓ Login node
+✓ Reusing job 25867015 on cn-0025
+✓ SSH ready: uv → cn-0025
+Opening VS Code...
+```
+
+If a new allocation is needed:
+
+```text
+Connecting to uv...
+✓ Login node
+No reusable job found.
+Requesting cpu_short · 1 CPU · 16G · 04:00:00
+Submitted job 25867102; waiting for a compute node...
+✓ Job 25867102 allocated on cn-0041
+✓ SSH ready: uv → cn-0041
+Opening VS Code...
+```
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `hjump init <cluster>` | Create a config template and open it in VS Code |
-| `hjump config` | Re-open the config file in VS Code |
-| `hjump go <cluster>` | Allocate a Slurm job (or reuse one) and launch VS Code on the compute node |
-| `hjump attach <cluster> <job-id>` | Attach VS Code to an already-running Slurm job |
-| `hjump diag [cluster]` | Check local tools; optionally verify the cluster connection end-to-end |
-| `hjump cancel <cluster> --job-id <id>` | Cancel a Slurm job |
-| `hjump ssh-config <cluster> --node <node>` | Write an SSH config entry for a specific compute node |
+| `hjump init <cluster>` | Interactive first-run setup and verification |
+| `hjump go <cluster>` | Reuse or allocate a Slurm session and open VS Code |
+| `hjump status [cluster]` | Show login endpoint, compute alias, jobs, resources, and time remaining |
+| `hjump stop <cluster>` | Stop hjump-owned jobs and clear the compute alias |
+| `hjump restart <cluster>` | Stop hjump-owned jobs and request a fresh session |
+| `hjump config [cluster]` | Open `config.toml` in VS Code |
+| `hjump diag [cluster]` | Diagnose local tools, SSH aliases, DNS endpoints, and Slurm |
+| `hjump attach <cluster> <job-id>` | Attach the compute alias to an existing Slurm job |
+| `hjump cancel <cluster> --job-id <id>` | Power-user command to cancel an explicit Slurm job |
+| `hjump ssh-config <cluster> --node <node>` | Point the managed compute alias at a node manually |
 
 ## Requirements
 
 - Python 3.11+
-- OpenSSH client available as `ssh` (most computers already have it)
+- OpenSSH client available as `ssh`
 - VS Code command-line launcher available as `code`
-- VS Code Remote-SSH extension: `ms-vscode-remote.remote-ssh`
-- A working SSH config or hostname for the HPC login node
+- VS Code Remote-SSH extension (`ms-vscode-remote.remote-ssh`)
+- Slurm commands available on the HPC login node
+
+Native Windows PowerShell is the primary Windows target. macOS and Linux are supported experimentally.
 
 ## Install
 
-### Windows
-
-Use native Windows PowerShell, not WSL, for the initial version.
-
-Modern Windows includes OpenSSH. Verify:
-
-```powershell
-ssh -V
-```
-
-Install pipx:
-
-```powershell
-py -m pip install --user pipx
-py -m pipx ensurepath
-```
-
-Restart PowerShell, then install:
-
-```powershell
-pipx install git+https://github.com/sbae/hjump.git
-```
-
-Verify:
-
-```powershell
-hjump --help
-code --version
-```
-
-If `code` is missing, reinstall VS Code with the option to add it to PATH, or enable the VS Code command-line launcher.
-
-### macOS (experimental)
-
-Using Homebrew and pipx:
+With pipx:
 
 ```bash
-brew install pipx
-pipx ensurepath
 pipx install git+https://github.com/sbae/hjump.git
+```
+
+Upgrade a GitHub installation with:
+
+```bash
+pipx install --force git+https://github.com/sbae/hjump.git
 ```
 
 Verify:
 
 ```bash
+hjump --help
 ssh -V
 code --version
-hjump --help
 ```
 
-If `code` is missing, open VS Code and run `Shell Command: Install 'code' command in PATH` from the command palette.
-
-### Linux (experimental)
-
-Ubuntu/Debian:
+## Interactive setup
 
 ```bash
-sudo apt install pipx
-pipx ensurepath
-pipx install git+https://github.com/sbae/hjump.git
+hjump init uv
 ```
 
-Generic Python install:
+The wizard asks for:
+
+```text
+Login host
+SSH port
+Username
+SSH key
+Local SSH alias
+Default partition
+Default time
+Default CPUs
+Default memory
+```
+
+It then writes `~/.config/hjump/config.toml`, creates the managed login alias, and checks SSH, Slurm, VS Code, and Remote-SSH.
+
+For the old editable-template workflow:
 
 ```bash
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-pipx install git+https://github.com/sbae/hjump.git
+hjump init uv --template
 ```
 
-Verify:
+## Managed SSH aliases
+
+For a profile named `uv` with `ssh_alias = "uv"`, hjump maintains:
+
+```sshconfig
+Host uv-login
+    HostName bigpurple.example.edu
+    Port 22
+    User username
+    IdentityFile ~/.ssh/id_ed25519
+
+Host uv
+    HostName cn-0025
+    User username
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyJump uv-login
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+```
+
+All hjump login-node control commands use the generated `uv-login` alias. The compute alias (`uv`) is what VS Code uses.
+
+## Login endpoint failover
+
+If a login hostname resolves to multiple addresses, hjump resolves the endpoints itself and rotates between them when SSH fails before authentication.
+
+Example:
+
+```text
+Login endpoint 10.189.18.101 unavailable (attempt 1/3): Connection refused
+Trying 10.189.18.102 in 1 second(s)...
+SSH connection succeeded on attempt 2/3 via 10.189.18.102.
+```
+
+Internal control connections deliberately avoid reusing a stale SSH `ControlMaster` socket so failover remains effective.
+
+## Resource presets
+
+Add optional presets to `config.toml`:
+
+```toml
+[clusters.uv]
+login_host = "bigpurple.example.edu"
+user = "username"
+ssh_alias = "uv"
+default_partition = "cpu_short"
+default_time = "04:00:00"
+default_cpus = 1
+default_mem = "16G"
+
+[clusters.uv.presets.small]
+cpus = 1
+mem = "16G"
+time = "04:00:00"
+
+[clusters.uv.presets.big]
+partition = "cpu_short"
+cpus = 8
+mem = "128G"
+time = "12:00:00"
+```
+
+Use them with:
 
 ```bash
-ssh -V
-code --version
-hjump --help
+hjump go uv --preset big
 ```
 
-### Upgrade
+Explicit CLI flags override preset values:
 
 ```bash
-pipx upgrade hjump
+hjump go uv --preset big --mem 192G
 ```
 
-## Configure
+## Status and lifecycle
 
 ```bash
-hjump init my-hpc
+hjump status uv
 ```
 
-This creates a starter config (at `~/.config/hjump/config.toml`) and opens it in VS Code automatically. Fill in at least:
+Shows the managed login alias, currently working login endpoint, compute alias, active hjump jobs, partition, CPU/memory request, and remaining time.
 
-- `login_host` — hostname or alias for your HPC login node
-- `user` — your HPC username
-- `remote_project_path` — path to your project on the cluster
-
-To open the config again later:
+Show every configured cluster:
 
 ```bash
-hjump config
+hjump status
 ```
 
-To overwrite an existing config:
+Stop hjump-owned jobs without looking up job IDs:
 
 ```bash
-hjump init my-hpc --force
+hjump stop uv
 ```
 
-## Check your setup
-
-Local-only checks:
+Request a completely fresh allocation:
 
 ```bash
-hjump diag
+hjump restart uv
+hjump restart uv --preset big
 ```
 
-Check a configured cluster, including login-node Slurm commands:
+## Diagnostics
 
 ```bash
-hjump diag my-hpc
+hjump diag uv
 ```
 
-Show each check as it runs and limit every remote check to 10 seconds:
+Cluster diagnostics include:
+
+- Python, OpenSSH, and VS Code
+- VS Code Remote-SSH
+- hjump config and SSH config permissions
+- generated `<alias>-login` configuration
+- every DNS-resolved login endpoint individually
+- rotating/failover SSH login
+- `squeue`, `salloc`, `scontrol`, and `scancel`
+
+Verbose mode exposes OpenSSH diagnostics:
 
 ```bash
-hjump diag my-hpc --verbose --remote-timeout 10
+hjump diag uv -v
+hjump go uv -v
 ```
 
-Skip remote checks:
+If `go` fails, it points directly to `hjump diag <cluster>`.
+
+## Self-healing behavior
+
+`hjump` refreshes its managed login SSH block before control operations and rewrites the compute alias whenever the selected Slurm node changes. `stop` removes the compute-node target when no hjump-owned jobs remain. Login endpoint failures are retried against alternate DNS addresses.
+
+The managed SSH block is bounded by comments such as:
+
+```text
+# >>> hjump managed: uv
+...
+# <<< hjump managed: uv
+```
+
+Content outside those markers is preserved.
+
+## Additional usage
 
 ```bash
-hjump diag my-hpc --no-remote
+hjump go uv --time 08:00:00 --cpus 4 --mem 64G
+hjump go uv --dir '~/project3'
+hjump go uv --existing-job 12345678
+hjump attach uv 12345678
 ```
 
-The `diag` command checks Python, `ssh`, `code`, configuration, VS Code Remote-SSH, login-node reachability, and remote Slurm commands.
-
-## Use
-
-```bash
-hjump go my-hpc
-```
-
-Show OpenSSH authentication and connection diagnostics:
-
-```bash
-hjump go my-hpc --verbose
-```
-
-Useful variants:
-
-```bash
-hjump go my-hpc --time 04:00:00 --cpus 1 --mem 16G
-hjump go my-hpc --dir '~/project3'
-hjump go my-hpc --existing-job 12345678
-hjump attach my-hpc 12345678
-hjump ssh-config my-hpc --node compute123
-hjump cancel my-hpc --job-id 12345678
-```
-
-## Notes
-
-`auto_reuse` is experimental. It reuses a matching RUNNING Slurm allocation, not shell state. Use tmux if you want to return to the same shell environment.
-
-This tool deliberately uses local OpenSSH via `subprocess` rather than a Python SSH library. That preserves your normal SSH behavior, including keys, MFA, Kerberos/GSSAPI, host-key checking, `ProxyJump`, and `ControlMaster`.
-
-WSL is not a first-class target yet. Native Windows PowerShell is the intended Windows path for now.
-
-### Windows SSH config permissions
-
-`hjump` restricts the generated SSH config ACL to the current user, SYSTEM,
-and the local Administrators group, as required by Windows OpenSSH. If an older
-generated config reports `Bad owner or permissions`, remove inherited and
-`OWNER RIGHTS` access with `icacls`, then grant the current user full control.
+`auto_reuse` reuses a matching RUNNING Slurm allocation, not prior shell state. Use tmux if persistent shell state is required.
