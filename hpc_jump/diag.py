@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import ClusterConfig
-from .slurm import run_login
+from .slurm import resolve_login_endpoints, run_login
+from .ssh_config import login_alias
 from .vscode import find_code_executable
 
 
@@ -37,8 +38,7 @@ def _first_line(text: str) -> str:
 
 def check_python() -> CheckResult:
     version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    ok = sys.version_info >= (3, 11)
-    return CheckResult("Python >= 3.11", ok, version)
+    return CheckResult("Python >= 3.11", sys.version_info >= (3, 11), version)
 
 
 def check_executable(name: str, command: list[str] | None = None) -> CheckResult:
@@ -68,12 +68,13 @@ def check_code_cli() -> CheckResult:
 
 
 def check_config_file(path: Path) -> CheckResult:
-    if not path.exists():
+    if not path.expanduser().exists():
         return CheckResult("config file", False, f"not found: {path}")
-    return CheckResult("config file", True, str(path))
+    return CheckResult("config file", True, str(path.expanduser()))
 
 
 def check_ssh_config_writable(path: Path) -> CheckResult:
+    path = path.expanduser()
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.exists():
@@ -83,6 +84,36 @@ def check_ssh_config_writable(path: Path) -> CheckResult:
         return CheckResult("SSH config writable", writable, f"parent: {path.parent}")
     except Exception as exc:
         return CheckResult("SSH config writable", False, str(exc))
+
+
+def check_ssh_alias(cluster: ClusterConfig, ssh_config: Path) -> CheckResult:
+    alias = login_alias(cluster)
+    try:
+        proc = _run_local(["ssh", "-F", str(ssh_config.expanduser()), "-G", alias], timeout=10)
+        if proc.returncode != 0:
+            detail = _first_line(proc.stderr) or "invalid SSH configuration"
+            return CheckResult(f"SSH alias {alias}", False, detail)
+        settings: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            key, separator, value = line.partition(" ")
+            if separator:
+                settings[key.casefold()] = value.strip()
+        hostname = settings.get("hostname", "unknown")
+        user = settings.get("user", "unknown")
+        port = settings.get("port", "unknown")
+        ok = hostname.casefold() == cluster.login_host.casefold()
+        return CheckResult(f"SSH alias {alias}", ok, f"{user}@{hostname}:{port}")
+    except Exception as exc:
+        return CheckResult(f"SSH alias {alias}", False, str(exc))
+
+
+def check_dns_endpoints(cluster: ClusterConfig) -> CheckResult:
+    endpoints = resolve_login_endpoints(cluster)
+    return CheckResult(
+        "login DNS endpoints",
+        bool(endpoints),
+        ", ".join(endpoints) if endpoints else f"no addresses resolved for {cluster.login_host}",
+    )
 
 
 def check_vscode_remote_ssh() -> CheckResult:
@@ -100,6 +131,16 @@ def check_vscode_remote_ssh() -> CheckResult:
         )
     except Exception as exc:
         return CheckResult("VS Code Remote-SSH extension", False, str(exc))
+
+
+def check_login_endpoint(cluster: ClusterConfig, endpoint: str, timeout: int = 15) -> CheckResult:
+    try:
+        proc = run_login(cluster, "echo ok", check=False, timeout=timeout, attempts=1, endpoint=endpoint)
+        ok = proc.returncode == 0 and proc.stdout.strip() == "ok"
+        detail = "reachable" if ok else (_first_line(proc.stderr) or _first_line(proc.stdout) or "failed")
+        return CheckResult(f"login endpoint {endpoint}", ok, detail)
+    except Exception as exc:
+        return CheckResult(f"login endpoint {endpoint}", False, str(exc))
 
 
 def check_login_reachable(cluster: ClusterConfig, timeout: int = 15) -> CheckResult:
