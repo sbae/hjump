@@ -30,6 +30,7 @@ class ClusterConfig:
     user: str | None = None
     identity_file: str | None = None
     ssh_alias: str | None = None
+    login_ssh_alias: str | None = None
     default_partition: str | None = None
     default_time: str = "04:00:00"
     default_cpus: int = 1
@@ -44,6 +45,10 @@ class ClusterConfig:
     @property
     def effective_ssh_alias(self) -> str:
         return self.ssh_alias or f"{self.name}-current"
+
+    @property
+    def effective_login_alias(self) -> str:
+        return self.login_ssh_alias or f"{self.effective_ssh_alias}-login"
 
     @property
     def effective_user(self) -> str:
@@ -118,6 +123,7 @@ def load_cluster(name: str, config_path: Path = DEFAULT_CONFIG_PATH) -> ClusterC
         user=data.get("user"),
         identity_file=data.get("identity_file"),
         ssh_alias=data.get("ssh_alias"),
+        login_ssh_alias=data.get("login_ssh_alias"),
         default_partition=data.get("default_partition"),
         default_time=str(data.get("default_time", "04:00:00")),
         default_cpus=int(data.get("default_cpus", 1)),
@@ -148,6 +154,8 @@ def render_cluster_config(cluster: ClusterConfig) -> str:
         lines.append(f"identity_file = {_toml_quote(cluster.identity_file)}")
     if cluster.ssh_alias:
         lines.append(f"ssh_alias = {_toml_quote(cluster.ssh_alias)}")
+    if cluster.login_ssh_alias:
+        lines.append(f"login_ssh_alias = {_toml_quote(cluster.login_ssh_alias)}")
     if cluster.remote_project_path:
         lines.append(f"remote_project_path = {_toml_quote(cluster.remote_project_path)}")
     if cluster.default_partition:
