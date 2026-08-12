@@ -179,3 +179,15 @@ def update_ssh_config(
     if changed or not path.exists():
         _write_config(path, updated)
     return changed
+
+
+def clear_compute_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> bool:
+    """Keep the login alias but remove a stale compute-node target."""
+    path = path.expanduser()
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    block = render_login_block(cluster)
+    updated = _replace_managed_block(existing, cluster, block)
+    changed = updated != existing
+    if changed or not path.exists():
+        _write_config(path, updated)
+    return changed
