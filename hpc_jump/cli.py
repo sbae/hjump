@@ -61,6 +61,16 @@ from .vscode import launch_vscode, open_in_vscode
 app = typer.Typer(no_args_is_help=True)
 console = Console()
 
+_PRIVATE_KEY_MARKERS = (
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+    b"-----BEGIN DSA PRIVATE KEY-----",
+    b"-----BEGIN PRIVATE KEY-----",
+    b"PuTTY-User-Key-File-",
+)
+_PREFERRED_IDENTITY_NAMES = ("id_ed25519", "id_rsa", "id_ecdsa")
+
 
 def clean_errors(func: Callable[..., object]) -> Callable[..., object]:
     @wraps(func)
@@ -87,26 +97,39 @@ def _warn(message: str) -> None:
     console.print(f"[yellow]![/yellow] {message}")
 
 
-def _find_identity_files() -> list[Path]:
-    ssh_dir = Path("~/.ssh").expanduser()
+def _looks_like_private_key(path: Path) -> bool:
+    if not path.is_file() or path.suffix.casefold() == ".pub":
+        return False
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(512)
+    except OSError:
+        return False
+    return any(marker in prefix for marker in _PRIVATE_KEY_MARKERS)
+
+
+def _find_identity_files(ssh_dir: Path | None = None) -> list[Path]:
+    ssh_dir = ssh_dir or Path("~/.ssh").expanduser()
+    if not ssh_dir.is_dir():
+        return []
+
     found: list[Path] = []
-    for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+    for name in _PREFERRED_IDENTITY_NAMES:
         candidate = ssh_dir / name
-        if candidate.is_file():
+        if _looks_like_private_key(candidate):
             found.append(candidate)
+
+    preferred = set(found)
+    extras = sorted(
+        (
+            candidate
+            for candidate in ssh_dir.iterdir()
+            if candidate not in preferred and _looks_like_private_key(candidate)
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    found.extend(extras)
     return found
-
-
-def _prompt_auth_method(default: int = 2) -> int:
-    console.print("\nSSH authentication:")
-    console.print("  [1] SSH key")
-    console.print("  [2] Password / MFA / interactive OpenSSH")
-    console.print("  [3] Existing SSH configuration")
-    while True:
-        choice = typer.prompt("Choice", default=default, type=int)
-        if choice in {1, 2, 3}:
-            return choice
-        _warn("Choose 1, 2, or 3.")
 
 
 def _prompt_key_path(default: Path | None = None) -> str:
@@ -119,6 +142,42 @@ def _prompt_key_path(default: Path | None = None) -> str:
         if path.is_file():
             return path.as_posix()
         _warn(f"Key file not found: {path}")
+
+
+def _prompt_authentication(identity_files: list[Path]) -> tuple[str, str | None]:
+    if identity_files:
+        console.print("\nFound SSH private keys:")
+        for index, path in enumerate(identity_files, start=1):
+            console.print(f"  [{index}] {path.as_posix()}")
+        choose_key = len(identity_files) + 1
+        password = choose_key + 1
+        existing = password + 1
+        console.print(f"  [{choose_key}] Choose another key")
+        console.print(f"  [{password}] Password / MFA / interactive OpenSSH")
+        console.print(f"  [{existing}] Existing SSH configuration")
+        default = 1
+    else:
+        console.print("\nNo SSH private keys found in ~/.ssh.")
+        console.print("\nSSH authentication:")
+        choose_key = 1
+        password = 2
+        existing = 3
+        console.print(f"  [{choose_key}] Choose SSH key")
+        console.print(f"  [{password}] Password / MFA / interactive OpenSSH")
+        console.print(f"  [{existing}] Existing SSH configuration")
+        default = password
+
+    while True:
+        choice = typer.prompt("Choice", default=default, type=int)
+        if 1 <= choice <= len(identity_files):
+            return "key", identity_files[choice - 1].as_posix()
+        if choice == choose_key:
+            return "key", _prompt_key_path()
+        if choice == password:
+            return "password", None
+        if choice == existing:
+            return "existing", None
+        _warn(f"Choose a number from 1 to {existing}.")
 
 
 def _configure_login_ssh(cluster: ClusterConfig, ssh_config: Path, verbose: bool = False) -> Path:
@@ -223,28 +282,13 @@ def init(
     console.print(f"Configure [bold]{cluster_name}[/bold]")
 
     identity_files = _find_identity_files()
-    identity_file: str | None = None
+    auth_method, identity_file = _prompt_authentication(identity_files)
     existing_login_alias: str | None = None
     existing_settings: dict[str, str] | None = None
 
-    if identity_files:
-        detected_key = identity_files[0]
-        console.print(f"\nFound SSH private key: [bold]{detected_key.as_posix()}[/bold]")
-        if typer.confirm("Use this key?", default=True):
-            auth_method = 1
-            identity_file = detected_key.as_posix()
-        else:
-            auth_method = _prompt_auth_method(default=2)
-    else:
-        console.print("\nNo standard SSH private key found in ~/.ssh.")
-        auth_method = _prompt_auth_method(default=2)
-
-    if auth_method == 1:
-        if identity_file is None:
-            identity_file = _prompt_key_path(identity_files[0] if identity_files else None)
-    elif auth_method == 2:
+    if auth_method == "password":
         console.print("[dim]hjump will not ask for or store your password. OpenSSH will prompt for password/MFA when needed.[/dim]")
-    elif auth_method == 3:
+    elif auth_method == "existing":
         existing_login_alias = typer.prompt("Existing SSH host/alias")
         existing_settings = resolve_ssh_alias(existing_login_alias, ssh_config)
         resolved_host = existing_settings.get("hostname")
