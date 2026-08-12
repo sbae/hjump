@@ -33,6 +33,25 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(loaded.presets["big"].mem, "128G")
             self.assertEqual(loaded.presets["big"].salloc_extra, ["--exclusive"])
 
+    def test_existing_login_alias_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            cluster = ClusterConfig(
+                name="uv",
+                login_host="login.example.edu",
+                port=2222,
+                user="alice",
+                ssh_alias="uv",
+                login_ssh_alias="existing-login",
+                default_partition=None,
+            )
+            upsert_cluster_config(cluster, path)
+            loaded = load_cluster("uv", path)
+            self.assertEqual(loaded.login_ssh_alias, "existing-login")
+            self.assertEqual(loaded.effective_login_alias, "existing-login")
+            self.assertIsNone(loaded.identity_file)
+            self.assertIsNone(loaded.default_partition)
+
     def test_upsert_preserves_other_cluster(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"
