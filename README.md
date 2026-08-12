@@ -89,23 +89,45 @@ code --version
 hjump init uv
 ```
 
-The wizard asks for:
+The wizard first looks for a standard private key in `~/.ssh` (`id_ed25519`, `id_rsa`, then `id_ecdsa`). If it finds one, it offers to use it. Otherwise, or if you decline, it offers:
 
 ```text
-Login host
-SSH port
-Username
-SSH key
-Local SSH alias
-Default partition
-Default time
-Default CPUs
-Default memory
+SSH authentication:
+  [1] SSH key
+  [2] Password / MFA / interactive OpenSSH
+  [3] Existing SSH configuration
+Choice [2]:
 ```
 
-It then writes `~/.config/hjump/config.toml`, creates the managed login alias, and checks SSH, Slurm, VS Code, and Remote-SSH.
+### SSH key
 
-For the old editable-template workflow:
+`hjump` stores only the path to the private key in its config. It never copies the key.
+
+### Password / MFA / interactive OpenSSH
+
+`hjump` does not ask for or store a password. OpenSSH handles password prompts, Duo/MFA, Kerberos/SSO, and similar interactive authentication when a connection is made.
+
+### Existing SSH configuration
+
+If you already have a working `Host` entry in `~/.ssh/config`, enter that alias. `hjump` resolves it with `ssh -G` and then uses that alias directly for login-node control commands and as the compute node's `ProxyJump`. Alias-specific routing such as `ProxyJump`, `ProxyCommand`, certificates, MFA, and other OpenSSH settings remain under OpenSSH's control.
+
+After authentication is configured, `hjump` tests the login and asks for a local compute alias. If Slurm is reachable, it discovers partitions with `sinfo` and uses the cluster-marked default partition when available:
+
+```text
+Testing SSH login...
+✓ SSH login via uv-login
+Detected Slurm partitions: cpu_short*, cpu_long, gpu
+Default partition [cpu_short]:
+Default time [04:00:00]:
+Default CPUs [1]:
+Default memory [16G]:
+```
+
+If partition discovery fails, the partition prompt defaults to blank, which means to use the Slurm cluster default rather than assuming a site-specific partition name.
+
+The wizard then writes `~/.config/hjump/config.toml`, prepares SSH routing, and checks SSH, Slurm, VS Code, and Remote-SSH.
+
+For the editable-template workflow:
 
 ```bash
 hjump init uv --template
@@ -113,7 +135,7 @@ hjump init uv --template
 
 ## Managed SSH aliases
 
-For a profile named `uv` with `ssh_alias = "uv"`, hjump maintains:
+For a normal key/password profile named `uv` with `ssh_alias = "uv"`, hjump maintains:
 
 ```sshconfig
 Host uv-login
@@ -131,11 +153,13 @@ Host uv
     ServerAliveCountMax 3
 ```
 
-All hjump login-node control commands use the generated `uv-login` alias. The compute alias (`uv`) is what VS Code uses.
+If password/MFA mode is selected, the `IdentityFile` lines are simply omitted.
+
+If an existing login alias is selected, hjump does not redefine it. The managed compute entry points its `ProxyJump` at that existing alias.
 
 ## Login endpoint failover
 
-If a login hostname resolves to multiple addresses, hjump resolves the endpoints itself and rotates between them when SSH fails before authentication.
+For hjump-managed login aliases, if a login hostname resolves to multiple addresses, hjump resolves the endpoints itself and rotates between them when SSH fails before authentication.
 
 Example:
 
@@ -144,6 +168,8 @@ Login endpoint 10.189.18.101 unavailable (attempt 1/3): Connection refused
 Trying 10.189.18.102 in 1 second(s)...
 SSH connection succeeded on attempt 2/3 via 10.189.18.102.
 ```
+
+If you chose an existing SSH alias, endpoint selection is delegated to OpenSSH so hjump does not override custom routing.
 
 Internal control connections deliberately avoid reusing a stale SSH `ControlMaster` socket so failover remains effective.
 
@@ -191,7 +217,7 @@ hjump go uv --preset big --mem 192G
 hjump status uv
 ```
 
-Shows the managed login alias, currently working login endpoint, compute alias, active hjump jobs, partition, CPU/memory request, and remaining time.
+Shows the login alias, currently working login endpoint, compute alias, active hjump jobs, partition, CPU/memory request, and remaining time.
 
 Show every configured cluster:
 
@@ -223,9 +249,10 @@ Cluster diagnostics include:
 - Python, OpenSSH, and VS Code
 - VS Code Remote-SSH
 - hjump config and SSH config permissions
-- generated `<alias>-login` configuration
-- every DNS-resolved login endpoint individually
-- rotating/failover SSH login
+- login SSH routing
+- DNS-resolved login endpoints
+- endpoint-by-endpoint checks for hjump-managed aliases
+- delegated OpenSSH routing for existing aliases
 - `squeue`, `salloc`, `scontrol`, and `scancel`
 
 Verbose mode exposes OpenSSH diagnostics:
@@ -239,7 +266,7 @@ If `go` fails, it points directly to `hjump diag <cluster>`.
 
 ## Self-healing behavior
 
-`hjump` refreshes its managed login SSH block before control operations and rewrites the compute alias whenever the selected Slurm node changes. `stop` removes the compute-node target when no hjump-owned jobs remain. Login endpoint failures are retried against alternate DNS addresses.
+`hjump` refreshes its managed SSH block before control operations and rewrites the compute alias whenever the selected Slurm node changes. `stop` removes the compute-node target when no hjump-owned jobs remain. Login endpoint failures are retried against alternate DNS addresses for hjump-managed login aliases.
 
 The managed SSH block is bounded by comments such as:
 
