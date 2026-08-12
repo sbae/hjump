@@ -239,11 +239,12 @@ def init(
         console.print("\nNo standard SSH private key found in ~/.ssh.")
         auth_method = _prompt_auth_method(default=2)
 
-    if auth_method == 1 and identity_file is None:
-        identity_file = _prompt_key_path(identity_files[0] if identity_files else None)
+    if auth_method == 1:
+        if identity_file is None:
+            identity_file = _prompt_key_path(identity_files[0] if identity_files else None)
     elif auth_method == 2:
         console.print("[dim]hjump will not ask for or store your password. OpenSSH will prompt for password/MFA when needed.[/dim]")
-    else:
+    elif auth_method == 3:
         existing_login_alias = typer.prompt("Existing SSH host/alias")
         existing_settings = resolve_ssh_alias(existing_login_alias, ssh_config)
         resolved_host = existing_settings.get("hostname")
