@@ -11,16 +11,28 @@ login_host = "login.hpc.edu"
 port = 22
 user = "your_username"
 
-# Optional SSH private key file. Forward slashes are easiest on Windows.
+# Authentication option A: explicit SSH private key.
+# Forward slashes are easiest on Windows.
 identity_file = "C:/Users/your_windows_username/.ssh/id_ed25519"
 
-# Stable local alias. hjump also manages <ssh_alias>-login.
+# Authentication option B: password/MFA/SSO.
+# Omit identity_file; hjump never stores passwords and lets OpenSSH prompt.
+
+# Authentication option C: reuse an existing Host entry from ~/.ssh/config.
+# When set, hjump uses that alias exactly for login-node commands and ProxyJump.
+# Omit identity_file if the existing alias already handles authentication.
+# login_ssh_alias = "existing-hpc-login"
+
+# Stable local compute alias. If login_ssh_alias is not set, hjump also
+# manages <ssh_alias>-login for the login node.
 ssh_alias = "{safe_name}"
 
 # Optional project folder opened automatically in VS Code.
 # remote_project_path = "/home/your_username/project"
 
-default_partition = "cpu_short"
+# Omit default_partition to use the Slurm cluster default.
+# The interactive init wizard discovers partitions with sinfo when possible.
+# default_partition = "cpu"
 default_time = "04:00:00"
 default_cpus = 1
 default_mem = "16G"
@@ -41,7 +53,7 @@ auto_reuse = true
 # time = "04:00:00"
 #
 # [clusters.{safe_name}.presets.big]
-# partition = "cpu_short"
+# partition = "cpu"
 # cpus = 8
 # mem = "128G"
 # time = "12:00:00"
