@@ -36,6 +36,7 @@ from .slurm import (
     SlurmJob,
     allocate_job,
     cancel_job,
+    discover_partitions,
     find_reusable_job,
     get_last_login_endpoint,
     list_owned_jobs,
@@ -52,6 +53,7 @@ from .ssh_config import (
     ensure_login_ssh_config,
     get_managed_compute_node,
     login_alias,
+    resolve_ssh_alias,
     update_ssh_config,
 )
 from .vscode import launch_vscode, open_in_vscode
@@ -85,13 +87,38 @@ def _warn(message: str) -> None:
     console.print(f"[yellow]![/yellow] {message}")
 
 
-def _default_identity_file() -> str:
+def _find_identity_files() -> list[Path]:
     ssh_dir = Path("~/.ssh").expanduser()
+    found: list[Path] = []
     for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
         candidate = ssh_dir / name
-        if candidate.exists():
-            return candidate.as_posix()
-    return (ssh_dir / "id_ed25519").as_posix()
+        if candidate.is_file():
+            found.append(candidate)
+    return found
+
+
+def _prompt_auth_method(default: int = 2) -> int:
+    console.print("\nSSH authentication:")
+    console.print("  [1] SSH key")
+    console.print("  [2] Password / MFA / interactive OpenSSH")
+    console.print("  [3] Existing SSH configuration")
+    while True:
+        choice = typer.prompt("Choice", default=default, type=int)
+        if choice in {1, 2, 3}:
+            return choice
+        _warn("Choose 1, 2, or 3.")
+
+
+def _prompt_key_path(default: Path | None = None) -> str:
+    while True:
+        if default is not None:
+            value = typer.prompt("SSH key", default=default.as_posix())
+        else:
+            value = typer.prompt("SSH key path")
+        path = Path(value).expanduser()
+        if path.is_file():
+            return path.as_posix()
+        _warn(f"Key file not found: {path}")
 
 
 def _configure_login_ssh(cluster: ClusterConfig, ssh_config: Path, verbose: bool = False) -> Path:
@@ -185,6 +212,7 @@ def init(
         return
 
     config = config.expanduser()
+    ssh_config = ssh_config.expanduser()
     if config.exists():
         clusters = load_config(config).get("clusters", {})
         if cluster_name in clusters and not force:
@@ -193,12 +221,95 @@ def init(
             force = True
 
     console.print(f"Configure [bold]{cluster_name}[/bold]")
-    login_host = typer.prompt("Login host")
-    port = typer.prompt("SSH port", default=22, type=int)
-    user = typer.prompt("Username", default=getpass.getuser())
-    identity_file = typer.prompt("SSH key", default=_default_identity_file())
-    ssh_alias = typer.prompt("Local SSH alias", default=cluster_name)
-    partition = typer.prompt("Default partition", default="cpu_short")
+
+    identity_files = _find_identity_files()
+    identity_file: str | None = None
+    existing_login_alias: str | None = None
+    existing_settings: dict[str, str] | None = None
+
+    if identity_files:
+        detected_key = identity_files[0]
+        console.print(f"\nFound SSH private key: [bold]{detected_key.as_posix()}[/bold]")
+        if typer.confirm("Use this key?", default=True):
+            auth_method = 1
+            identity_file = detected_key.as_posix()
+        else:
+            auth_method = _prompt_auth_method(default=2)
+    else:
+        console.print("\nNo standard SSH private key found in ~/.ssh.")
+        auth_method = _prompt_auth_method(default=2)
+
+    if auth_method == 1 and identity_file is None:
+        identity_file = _prompt_key_path(identity_files[0] if identity_files else None)
+    elif auth_method == 2:
+        console.print("[dim]hjump will not ask for or store your password. OpenSSH will prompt for password/MFA when needed.[/dim]")
+    else:
+        existing_login_alias = typer.prompt("Existing SSH host/alias")
+        existing_settings = resolve_ssh_alias(existing_login_alias, ssh_config)
+        resolved_host = existing_settings.get("hostname")
+        if not resolved_host:
+            raise RuntimeError(f"SSH alias {existing_login_alias!r} has no resolved HostName.")
+        resolved_user = existing_settings.get("user", getpass.getuser())
+        resolved_port = existing_settings.get("port", "22")
+        _ok(f"Existing SSH alias: {existing_login_alias} → {resolved_user}@{resolved_host}:{resolved_port}")
+
+    if existing_settings is not None:
+        login_host = existing_settings["hostname"]
+        port = int(existing_settings.get("port", "22"))
+        user = existing_settings.get("user") or getpass.getuser()
+    else:
+        login_host = typer.prompt("Login host")
+        port = typer.prompt("SSH port", default=22, type=int)
+        user = typer.prompt("Username", default=getpass.getuser())
+
+    default_compute_alias = cluster_name
+    if existing_login_alias and existing_login_alias == default_compute_alias:
+        default_compute_alias = f"{cluster_name}-compute"
+    ssh_alias = typer.prompt("Local compute SSH alias", default=default_compute_alias)
+    if existing_login_alias and ssh_alias == existing_login_alias:
+        raise ValueError("Compute SSH alias must differ from the existing login SSH alias.")
+
+    provisional = ClusterConfig(
+        name=cluster_name,
+        login_host=login_host,
+        port=port,
+        user=user,
+        identity_file=identity_file,
+        ssh_alias=ssh_alias,
+        login_ssh_alias=existing_login_alias,
+        default_partition=None,
+    )
+    _configure_login_ssh(provisional, ssh_config)
+
+    console.print("\nTesting SSH login...")
+    login_proc = run_login(provisional, "true", check=False)
+    login_ok = login_proc.returncode == 0
+    if login_ok:
+        _ok(f"SSH login via {login_alias(provisional)}")
+    else:
+        detail = login_proc.stderr.strip().splitlines()[-1] if login_proc.stderr.strip() else "connection failed"
+        _warn(f"SSH login test failed: {detail}")
+        _warn("Continuing setup; run 'hjump diag' after saving to troubleshoot.")
+
+    partitions: list[str] = []
+    detected_default: str | None = None
+    if login_ok:
+        partitions, detected_default = discover_partitions(provisional)
+        if partitions:
+            labels = [f"{name}*" if name == detected_default else name for name in partitions]
+            console.print(f"Detected Slurm partitions: [bold]{', '.join(labels)}[/bold]")
+
+    if detected_default:
+        partition = typer.prompt("Default partition", default=detected_default)
+    else:
+        partition = typer.prompt(
+            "Default partition (blank = cluster default)",
+            default="",
+            show_default=False,
+        )
+    if partitions and partition and partition not in partitions:
+        _warn(f"Partition {partition!r} was not returned by sinfo; saving it anyway.")
+
     time_limit = typer.prompt("Default time", default="04:00:00")
     cpus = typer.prompt("Default CPUs", default=1, type=int)
     mem = typer.prompt("Default memory", default="16G")
@@ -208,8 +319,9 @@ def init(
         login_host=login_host,
         port=port,
         user=user,
-        identity_file=identity_file or None,
+        identity_file=identity_file,
         ssh_alias=ssh_alias,
+        login_ssh_alias=existing_login_alias,
         default_partition=partition or None,
         default_time=time_limit,
         default_cpus=cpus,
@@ -218,7 +330,10 @@ def init(
     path = upsert_cluster_config(cluster, config, overwrite=force)
     _ok(f"Configuration saved: {path}")
     _configure_login_ssh(cluster, ssh_config)
-    _ok(f"SSH alias ready: {login_alias(cluster)}")
+    if cluster.login_ssh_alias:
+        _ok(f"Using existing SSH login alias: {cluster.login_ssh_alias}")
+    else:
+        _ok(f"SSH login alias ready: {login_alias(cluster)}")
 
     if verify:
         console.print("\nVerifying setup...")
@@ -545,7 +660,7 @@ def diag(
     remote_timeout: int = typer.Option(15, "--remote-timeout", min=1),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Diagnose local tools, managed SSH aliases, endpoints, and Slurm."""
+    """Diagnose local tools, SSH routing, endpoints, and Slurm."""
     set_ssh_verbose(verbose)
     console.print(f"Platform: {platform_summary()}")
     results: list[CheckResult] = []
@@ -577,21 +692,35 @@ def diag(
     if cluster is not None and remote:
         try:
             _configure_login_ssh(cluster, ssh_config, verbose=verbose)
-            results.append(CheckResult("managed SSH block", True, str(ssh_config.expanduser())))
+            routing_detail = (
+                f"existing alias {cluster.login_ssh_alias}"
+                if cluster.login_ssh_alias
+                else str(ssh_config.expanduser())
+            )
+            results.append(CheckResult("SSH routing", True, routing_detail))
         except Exception as exc:
-            results.append(CheckResult("managed SSH block", False, str(exc)))
+            results.append(CheckResult("SSH routing", False, str(exc)))
             cluster = None
 
     if cluster is not None and remote:
-        run_check("managed login alias", lambda: check_ssh_alias(cluster, ssh_config))
+        run_check("login alias", lambda: check_ssh_alias(cluster, ssh_config))
         run_check("login DNS", lambda: check_dns_endpoints(cluster))
-        endpoints = resolve_login_endpoints(cluster)
-        for endpoint in endpoints:
-            run_check(
-                f"endpoint {endpoint}",
-                lambda endpoint=endpoint: check_login_endpoint(cluster, endpoint, timeout=remote_timeout),
+        if cluster.login_ssh_alias:
+            results.append(
+                CheckResult(
+                    "endpoint selection",
+                    True,
+                    f"delegated to OpenSSH alias {cluster.login_ssh_alias}",
+                )
             )
-        run_check("rotating SSH login", lambda: check_login_reachable(cluster, timeout=remote_timeout))
+        else:
+            endpoints = resolve_login_endpoints(cluster)
+            for endpoint in endpoints:
+                run_check(
+                    f"endpoint {endpoint}",
+                    lambda endpoint=endpoint: check_login_endpoint(cluster, endpoint, timeout=remote_timeout),
+                )
+        run_check("SSH login", lambda: check_login_reachable(cluster, timeout=remote_timeout))
         for command in ("squeue", "salloc", "scontrol", "scancel"):
             run_check(
                 f"remote {command}",
