@@ -18,6 +18,7 @@ DEFAULT_SSH_ATTEMPTS = 3
 SSH_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 _SSH_VERBOSE = False
 _SSH_CONFIG_PATH: Path | None = None
+_LAST_LOGIN_ENDPOINT: str | None = None
 _OUTPUT_START = "__HPC_JUMP_OUTPUT_START__"
 _OUTPUT_END = "__HPC_JUMP_OUTPUT_END__"
 _TRANSIENT_SSH_MARKERS = (
@@ -28,6 +29,7 @@ _TRANSIENT_SSH_MARKERS = (
     "connection closed by remote host",
     "connection timed out",
     "connection aborted",
+    "connection to unknown port",
 )
 
 FATAL_PENDING_REASONS = {
@@ -54,6 +56,11 @@ class SlurmJob:
     node: str | None = None
     name: str | None = None
     reason: str | None = None
+    partition: str | None = None
+    cpus: int | None = None
+    memory: str | None = None
+    time_left: str | None = None
+    time_limit: str | None = None
 
 
 class PendingJobError(RuntimeError):
@@ -73,6 +80,11 @@ def _ssh_args(cluster: ClusterConfig, endpoint: str | None = None) -> list[str]:
         args.extend(["-F", str(_SSH_CONFIG_PATH)])
     if _SSH_VERBOSE:
         args.append("-v")
+
+    # Internal control commands should always establish a fresh connection.
+    # This prevents a stale ControlMaster socket from defeating endpoint rotation.
+    args.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no"])
+
     if endpoint:
         args.extend(
             [
@@ -95,13 +107,13 @@ def set_ssh_config_path(path: Path | None) -> None:
     _SSH_CONFIG_PATH = path.expanduser() if path is not None else None
 
 
-def _resolve_login_endpoints(cluster: ClusterConfig) -> list[str]:
+def get_last_login_endpoint() -> str | None:
+    return _LAST_LOGIN_ENDPOINT
+
+
+def resolve_login_endpoints(cluster: ClusterConfig) -> list[str]:
     try:
-        records = socket.getaddrinfo(
-            cluster.login_host,
-            cluster.port,
-            type=socket.SOCK_STREAM,
-        )
+        records = socket.getaddrinfo(cluster.login_host, cluster.port, type=socket.SOCK_STREAM)
     except OSError:
         return []
 
@@ -132,7 +144,10 @@ def run_login(
     check: bool = True,
     timeout: int = DEFAULT_SSH_TIMEOUT_SECONDS,
     attempts: int = DEFAULT_SSH_ATTEMPTS,
+    endpoint: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    global _LAST_LOGIN_ENDPOINT
+
     init = f"{cluster.remote_init} || exit $?; " if cluster.remote_init else ""
     framed = (
         f"{init}printf '{_OUTPUT_START}\n'; {command}; status=$?; "
@@ -140,20 +155,24 @@ def run_login(
     )
     remote_command = f"bash -lc {shlex.quote(framed)}"
 
-    endpoints = _resolve_login_endpoints(cluster)
-    total_attempts = max(1, attempts, len(endpoints))
-    candidates: list[str | None]
-    if endpoints:
-        candidates = [endpoints[index % len(endpoints)] for index in range(total_attempts)]
+    if endpoint is not None:
+        candidates: list[str | None] = [endpoint]
     else:
-        candidates = [None] * total_attempts
+        endpoints = resolve_login_endpoints(cluster)
+        total_attempts = max(1, attempts, len(endpoints))
+        candidates = (
+            [endpoints[index % len(endpoints)] for index in range(total_attempts)]
+            if endpoints
+            else [None] * total_attempts
+        )
 
     proc: subprocess.CompletedProcess[str] | None = None
-    for index, endpoint in enumerate(candidates):
+    for index, candidate in enumerate(candidates):
         attempt = index + 1
+        total_attempts = len(candidates)
         proc = subprocess.run(
             [
-                *_ssh_args(cluster, endpoint),
+                *_ssh_args(cluster, candidate),
                 "-o",
                 f"ConnectTimeout={min(timeout, DEFAULT_SSH_TIMEOUT_SECONDS)}",
                 _ssh_target(cluster),
@@ -169,30 +188,28 @@ def run_login(
         if _SSH_VERBOSE and proc.stderr:
             print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
 
+        if proc.returncode == 0:
+            _LAST_LOGIN_ENDPOINT = candidate or cluster.login_host
+            if attempt > 1:
+                endpoint_text = f" via {candidate}" if candidate else ""
+                print(f"SSH connection succeeded on attempt {attempt}/{total_attempts}{endpoint_text}.", file=sys.stderr)
+            break
+
         if not _is_transient_ssh_failure(proc) or attempt == total_attempts:
-            if attempt > 1 and proc.returncode == 0:
-                endpoint_text = f" via {endpoint}" if endpoint else ""
-                print(
-                    f"SSH connection succeeded on attempt {attempt}/{total_attempts}{endpoint_text}.",
-                    file=sys.stderr,
-                )
             break
 
         next_endpoint = candidates[index + 1]
         delay = SSH_RETRY_DELAYS_SECONDS[min(index, len(SSH_RETRY_DELAYS_SECONDS) - 1)]
-        endpoint_text = endpoint or cluster.login_host
+        endpoint_text = candidate or cluster.login_host
         print(
-            f"SSH connection to login endpoint {endpoint_text} failed before authentication "
-            f"(attempt {attempt}/{total_attempts}): {_brief_ssh_failure(proc)}",
+            f"Login endpoint {endpoint_text} unavailable (attempt {attempt}/{total_attempts}): "
+            f"{_brief_ssh_failure(proc)}",
             file=sys.stderr,
         )
-        if next_endpoint and next_endpoint != endpoint:
-            print(
-                f"Trying next login endpoint {next_endpoint} in {delay:g} second(s)...",
-                file=sys.stderr,
-            )
+        if next_endpoint and next_endpoint != candidate:
+            print(f"Trying {next_endpoint} in {delay:g} second(s)...", file=sys.stderr)
         else:
-            print(f"Retrying SSH connection in {delay:g} second(s)...", file=sys.stderr)
+            print(f"Retrying in {delay:g} second(s)...", file=sys.stderr)
         time.sleep(delay)
 
     if proc is None:
@@ -215,55 +232,75 @@ def run_login(
 def _first_host_from_nodelist(cluster: ClusterConfig, nodelist: str) -> str | None:
     if not nodelist or nodelist in {"(null)", "None", "N/A"}:
         return None
+    if not any(char in nodelist for char in "[,]"):
+        return nodelist
     out = run_login(cluster, f"scontrol show hostnames {shlex.quote(nodelist)} | head -n 1").stdout.strip()
     return out or None
 
 
-def resolve_job(cluster: ClusterConfig, job_id: str) -> SlurmJob:
-    fmt = "%i|%T|%N|%j|%r"
-    out = run_login(cluster, f"squeue -j {shlex.quote(job_id)} -h -o {shlex.quote(fmt)}").stdout.strip()
-    if not out:
-        raise RuntimeError(f"No active Slurm job found with id {job_id}")
-    line = out.splitlines()[0]
-    parts = line.split("|", 4)
-    if len(parts) != 5:
+def _clean_field(value: str) -> str | None:
+    return None if value in {"", "None", "(null)", "N/A"} else value
+
+
+def _parse_job_line(cluster: ClusterConfig, line: str) -> SlurmJob:
+    parts = line.split("|", 9)
+    if len(parts) != 10:
         raise RuntimeError(f"Could not parse squeue output: {line}")
-    job, state, nodelist, name, reason = parts
+    job_id, state, partition, nodelist, name, cpus, memory, time_left, time_limit, reason = parts
     return SlurmJob(
-        job_id=job,
+        job_id=job_id,
         state=state,
         node=_first_host_from_nodelist(cluster, nodelist),
-        name=name,
-        reason=None if reason in {"", "None", "(null)", "N/A"} else reason,
+        name=_clean_field(name),
+        reason=_clean_field(reason),
+        partition=_clean_field(partition),
+        cpus=int(cpus) if cpus.isdigit() else None,
+        memory=_clean_field(memory),
+        time_left=_clean_field(time_left),
+        time_limit=_clean_field(time_limit),
     )
 
 
-def find_reusable_job(cluster: ClusterConfig, partition: str | None = None) -> SlurmJob | None:
-    fmt = "%i|%T|%P|%N|%j"
-    cmd = f"squeue -u $USER -h -t RUNNING -o {shlex.quote(fmt)}"
-    proc = run_login(cluster, cmd, check=False)
-    if proc.returncode != 0:
-        detail = "" if _SSH_VERBOSE else (proc.stderr.strip() or proc.stdout.strip())
-        message = (
-            "Could not check for reusable Slurm jobs because the remote SSH command failed. "
-            f"Exit code={proc.returncode}."
-        )
-        if detail:
-            message = f"{message}\n{detail}"
-        raise RuntimeError(message)
-    if not proc.stdout.strip():
-        return None
+def _squeue_format() -> str:
+    return "%i|%T|%P|%N|%j|%C|%m|%L|%l|%r"
 
-    for line in proc.stdout.splitlines():
-        parts = line.split("|", 4)
-        if len(parts) != 5:
+
+def resolve_job(cluster: ClusterConfig, job_id: str) -> SlurmJob:
+    cmd = f"squeue -j {shlex.quote(job_id)} -h -o {shlex.quote(_squeue_format())}"
+    out = run_login(cluster, cmd).stdout.strip()
+    if not out:
+        raise RuntimeError(f"No active Slurm job found with id {job_id}")
+    return _parse_job_line(cluster, out.splitlines()[0])
+
+
+def list_owned_jobs(cluster: ClusterConfig, running_only: bool = False) -> list[SlurmJob]:
+    state_arg = " -t RUNNING" if running_only else ""
+    cmd = f"squeue -u $USER -h{state_arg} -o {shlex.quote(_squeue_format())}"
+    out = run_login(cluster, cmd).stdout.strip()
+    if not out:
+        return []
+
+    jobs: list[SlurmJob] = []
+    for line in out.splitlines():
+        try:
+            job = _parse_job_line(cluster, line)
+        except RuntimeError:
             continue
-        job_id, state, job_partition, nodelist, name = parts
-        if name != cluster.job_name_prefix or (partition and job_partition != partition):
+        if job.name == cluster.job_name_prefix:
+            jobs.append(job)
+    return jobs
+
+
+def find_reusable_job(cluster: ClusterConfig, partition: str | None = None) -> SlurmJob | None:
+    try:
+        jobs = list_owned_jobs(cluster, running_only=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Could not check for reusable Slurm jobs. {exc}") from exc
+    for job in jobs:
+        if partition and job.partition != partition:
             continue
-        node = _first_host_from_nodelist(cluster, nodelist)
-        if node:
-            return SlurmJob(job_id=job_id, state=state, node=node, name=name)
+        if job.node:
+            return job
     return None
 
 
@@ -288,22 +325,14 @@ def allocate_job(
         args.append(f"--partition={partition}")
     args.extend(extra or [])
 
-    proc = run_login(
-        cluster,
-        " ".join(shlex.quote(x) for x in args),
-        check=False,
-        timeout=timeout_seconds,
-    )
+    proc = run_login(cluster, " ".join(shlex.quote(item) for item in args), check=False, timeout=timeout_seconds)
     combined = "\n".join([proc.stdout, proc.stderr])
     match = re.search(r"\b(?:Granted|Pending) job allocation (\d+)\b", combined)
     if match:
         return match.group(1)
 
     if proc.returncode == 255:
-        message = (
-            "SSH connection to the HPC login node failed before Slurm could allocate a job. "
-            f"Target={_ssh_target(cluster)}."
-        )
+        message = f"SSH connection to {_ssh_target(cluster)} failed before Slurm could allocate a job."
         if not _SSH_VERBOSE:
             message = f"{message}\nSSH stderr: {proc.stderr.strip() or '(empty)'}"
         raise RuntimeError(message)
@@ -372,3 +401,10 @@ def wait_for_node(
 
 def cancel_job(cluster: ClusterConfig, job_id: str) -> None:
     run_login(cluster, f"scancel {shlex.quote(job_id)}")
+
+
+def cancel_owned_jobs(cluster: ClusterConfig) -> list[str]:
+    jobs = list_owned_jobs(cluster)
+    for job in jobs:
+        cancel_job(cluster, job.job_id)
+    return [job.job_id for job in jobs]
