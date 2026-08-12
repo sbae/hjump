@@ -7,61 +7,43 @@ def config_template(cluster_name: str = "my-hpc") -> str:
 # Create one [clusters.<name>] section per cluster.
 
 [clusters.{safe_name}]
-
-# Login node hostname or FQDN.
-# Examples:
-#   login.hpc.edu
 login_host = "login.hpc.edu"
-
-# SSH port. Most clusters use 22.
 port = 22
-
-# Username used when logging into the cluster.
-# Usually your HPC/Linux/Kerberos username, not your email address.
 user = "your_username"
 
-# Optional SSH private key file.
-# Use forward slashes in TOML paths, even on Windows.
-# Good Windows example: C:/Users/your_windows_username/.ssh/id_ed25519
-# Bad Windows example:  C:\Users\your_windows_username\.ssh\id_ed25519
-# macOS/Linux example: ~/.ssh/id_ed25519
+# Optional SSH private key file. Forward slashes are easiest on Windows.
 identity_file = "C:/Users/your_windows_username/.ssh/id_ed25519"
 
-# Local SSH alias managed by hjump.
-# This is the name VS Code connects to after hjump resolves the compute node.
-ssh_alias = "hpc-cpu-short"
+# Stable local alias. hjump also manages <ssh_alias>-login.
+ssh_alias = "{safe_name}"
 
 # Optional project folder opened automatically in VS Code.
-# Leave this unset by default so VS Code can restore its previous remote window/folder.
-# Uncomment to always open a specific folder.
 # remote_project_path = "/home/your_username/project"
 
-# Default Slurm partition/queue.
 default_partition = "cpu_short"
-
-# Default interactive allocation duration.
 default_time = "04:00:00"
-
-# Default CPU request for the editor session.
 default_cpus = 1
-
-# Default total memory request.
-# For clusters that require memory per CPU, use salloc_extra below instead.
 default_mem = "16G"
-
-# Extra Slurm flags passed to salloc.
-# Example: salloc_extra = ["--mem-per-cpu=30G"]
 salloc_extra = []
 
 # Optional command run before every remote Slurm command.
-# Uncomment when your cluster requires Slurm to be loaded as a module.
 # remote_init = "module load slurm"
 
-# Slurm job name used for hjump-created sessions.
-# auto_reuse only considers RUNNING jobs with this exact Slurm job name.
 job_name_prefix = "hjump"
-
-# Experimental: reuse an existing RUNNING hjump Slurm job instead of requesting a new allocation.
-# This reuses the Slurm allocation/node, not your prior shell state.
 auto_reuse = true
+
+# Optional named resource presets. CLI flags override preset values.
+# Example usage: hjump go {safe_name} --preset big
+#
+# [clusters.{safe_name}.presets.small]
+# cpus = 1
+# mem = "16G"
+# time = "04:00:00"
+#
+# [clusters.{safe_name}.presets.big]
+# partition = "cpu_short"
+# cpus = 8
+# mem = "128G"
+# time = "12:00:00"
+# salloc_extra = []
 '''
