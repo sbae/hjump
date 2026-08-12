@@ -111,19 +111,10 @@ def _replace_managed_block(existing: str, cluster: ClusterConfig, block: str) ->
 
 
 def _extract_compute_node(managed: str, alias: str) -> str | None:
-    """Return HostName from the last exact managed compute-host stanza.
-
-    Exact line matching matters because an alias such as ``uv`` is also a
-    substring of the generated login alias ``uv-login``. Choosing the last
-    exact stanza also repairs blocks corrupted by the older substring parser.
-    """
+    """Return HostName from the last exact managed compute-host stanza."""
     lines = managed.splitlines()
     expected_host = f"host {alias}".casefold()
-    host_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if line.strip().casefold() == expected_host
-    ]
+    host_indexes = [index for index, line in enumerate(lines) if line.strip().casefold() == expected_host]
 
     for host_index in reversed(host_indexes):
         for line in lines[host_index + 1 :]:
@@ -138,14 +129,26 @@ def _extract_compute_node(managed: str, alias: str) -> str | None:
     return None
 
 
+def get_managed_compute_node(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> str | None:
+    path = path.expanduser()
+    if not path.exists():
+        return None
+    existing = path.read_text(encoding="utf-8")
+    start, end = _markers(cluster.name)
+    if start not in existing or end not in existing:
+        return None
+    managed = existing.split(start, 1)[1].split(end, 1)[0]
+    return _extract_compute_node(managed, cluster.effective_ssh_alias)
+
+
 def _write_config(path: Path, content: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     _secure_config_permissions(path)
 
 
-def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> None:
-    """Create or refresh the login alias and repair its managed block."""
+def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> bool:
+    """Create/refresh the login alias, repair the managed block, and report changes."""
     path = path.expanduser()
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     start, end = _markers(cluster.name)
@@ -155,20 +158,24 @@ def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CON
         managed = existing.split(start, 1)[1].split(end, 1)[0]
         compute_node = _extract_compute_node(managed, cluster.effective_ssh_alias)
 
-    block = (
-        render_host_block(cluster, compute_node)
-        if compute_node
-        else render_login_block(cluster)
-    )
-    _write_config(path, _replace_managed_block(existing, cluster, block))
+    block = render_host_block(cluster, compute_node) if compute_node else render_login_block(cluster)
+    updated = _replace_managed_block(existing, cluster, block)
+    changed = updated != existing
+    if changed or not path.exists():
+        _write_config(path, updated)
+    return changed
 
 
 def update_ssh_config(
     cluster: ClusterConfig,
     compute_node: str,
     path: Path = DEFAULT_SSH_CONFIG,
-) -> None:
+) -> bool:
     path = path.expanduser()
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     block = render_host_block(cluster, compute_node)
-    _write_config(path, _replace_managed_block(existing, cluster, block))
+    updated = _replace_managed_block(existing, cluster, block)
+    changed = updated != existing
+    if changed or not path.exists():
+        _write_config(path, updated)
+    return changed
