@@ -81,8 +81,6 @@ def _ssh_args(cluster: ClusterConfig, endpoint: str | None = None) -> list[str]:
     if _SSH_VERBOSE:
         args.append("-v")
 
-    # Internal control commands should always establish a fresh connection.
-    # This prevents a stale ControlMaster socket from defeating endpoint rotation.
     args.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no"])
 
     if endpoint:
@@ -122,6 +120,10 @@ def resolve_login_endpoints(cluster: ClusterConfig) -> list[str]:
         endpoint = str(sockaddr[0])
         if endpoint not in endpoints:
             endpoints.append(endpoint)
+
+    if _LAST_LOGIN_ENDPOINT in endpoints:
+        endpoints.remove(_LAST_LOGIN_ENDPOINT)
+        endpoints.insert(0, _LAST_LOGIN_ENDPOINT)
     return endpoints
 
 
