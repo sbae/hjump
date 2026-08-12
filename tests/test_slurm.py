@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import socket
+import subprocess
 import unittest
 from unittest.mock import patch
 
 from hpc_jump.config import ClusterConfig
-from hpc_jump.slurm import _parse_job_line, resolve_login_endpoints
+from hpc_jump.slurm import _parse_job_line, discover_partitions, resolve_login_endpoints
 
 
 class SlurmTests(unittest.TestCase):
@@ -31,6 +32,19 @@ class SlurmTests(unittest.TestCase):
         ]
         cluster = ClusterConfig(name="uv", login_host="login.example.edu")
         self.assertEqual(resolve_login_endpoints(cluster), ["10.0.0.1", "10.0.0.2"])
+
+    @patch("hpc_jump.slurm.run_login")
+    def test_discover_partitions_uses_slurm_default(self, run_login_mock) -> None:
+        run_login_mock.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="cpu_short*\ncpu_long\ncpu_short*\n",
+            stderr="",
+        )
+        cluster = ClusterConfig(name="uv", login_host="login.example.edu")
+        partitions, default_partition = discover_partitions(cluster)
+        self.assertEqual(partitions, ["cpu_short", "cpu_long"])
+        self.assertEqual(default_partition, "cpu_short")
 
 
 if __name__ == "__main__":
