@@ -23,7 +23,30 @@ def _identity_file(cluster: ClusterConfig) -> str | None:
 
 
 def login_alias(cluster: ClusterConfig) -> str:
-    return f"{cluster.effective_ssh_alias}-login"
+    return cluster.effective_login_alias
+
+
+def resolve_ssh_alias(alias: str, path: Path = DEFAULT_SSH_CONFIG) -> dict[str, str]:
+    """Return effective OpenSSH settings for an existing host alias."""
+    path = path.expanduser()
+    proc = subprocess.run(
+        ["ssh", "-F", str(path), "-G", alias],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "invalid SSH configuration"
+        raise RuntimeError(f"Could not resolve SSH alias {alias!r}: {detail}")
+
+    settings: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and value.strip():
+            settings.setdefault(key.casefold(), value.strip())
+    return settings
 
 
 def _secure_config_permissions(path: Path) -> None:
@@ -49,6 +72,9 @@ def _secure_config_permissions(path: Path) -> None:
 
 
 def _render_login_host(cluster: ClusterConfig) -> list[str]:
+    if cluster.login_ssh_alias:
+        return []
+
     lines = [
         f"Host {login_alias(cluster)}",
         f"    HostName {cluster.login_host}",
@@ -63,6 +89,8 @@ def _render_login_host(cluster: ClusterConfig) -> list[str]:
 
 
 def render_login_block(cluster: ClusterConfig) -> str:
+    if cluster.login_ssh_alias:
+        return ""
     start, end = _markers(cluster.name)
     return "\n".join([start, *_render_login_host(cluster), end, ""])
 
@@ -70,13 +98,11 @@ def render_login_block(cluster: ClusterConfig) -> str:
 def render_host_block(cluster: ClusterConfig, compute_node: str) -> str:
     start, end = _markers(cluster.name)
     identity_file = _identity_file(cluster)
-    lines = [
-        start,
-        *_render_login_host(cluster),
-        "",
-        f"Host {cluster.effective_ssh_alias}",
-        f"    HostName {compute_node}",
-    ]
+    lines = [start]
+    login_lines = _render_login_host(cluster)
+    if login_lines:
+        lines.extend([*login_lines, ""])
+    lines.extend([f"Host {cluster.effective_ssh_alias}", f"    HostName {compute_node}"])
     if cluster.user:
         lines.append(f"    User {cluster.user}")
     if identity_file:
@@ -103,11 +129,17 @@ def _replace_managed_block(existing: str, cluster: ClusterConfig, block: str) ->
             "Please repair or remove the managed block markers before retrying."
         )
 
+    clean_block = block.strip()
     if has_start:
         before, rest = existing.split(start, 1)
         _, after = rest.split(end, 1)
-        return before.rstrip() + "\n\n" + block + after.lstrip()
-    return existing.rstrip() + "\n\n" + block
+        pieces = [before.rstrip(), clean_block, after.lstrip()]
+        updated = "\n\n".join(piece for piece in pieces if piece)
+        return updated + ("\n" if updated else "")
+
+    if not clean_block:
+        return existing
+    return existing.rstrip() + "\n\n" + clean_block + "\n"
 
 
 def _extract_compute_node(managed: str, alias: str) -> str | None:
@@ -148,7 +180,7 @@ def _write_config(path: Path, content: str) -> None:
 
 
 def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> bool:
-    """Create/refresh the login alias, repair the managed block, and report changes."""
+    """Refresh hjump's managed SSH block without modifying an external login alias."""
     path = path.expanduser()
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     start, end = _markers(cluster.name)
@@ -158,10 +190,13 @@ def ensure_login_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CON
         managed = existing.split(start, 1)[1].split(end, 1)[0]
         compute_node = _extract_compute_node(managed, cluster.effective_ssh_alias)
 
-    block = render_host_block(cluster, compute_node) if compute_node else render_login_block(cluster)
+    if compute_node:
+        block = render_host_block(cluster, compute_node)
+    else:
+        block = render_login_block(cluster)
     updated = _replace_managed_block(existing, cluster, block)
     changed = updated != existing
-    if changed or not path.exists():
+    if changed or (not path.exists() and updated):
         _write_config(path, updated)
     return changed
 
@@ -182,12 +217,12 @@ def update_ssh_config(
 
 
 def clear_compute_ssh_config(cluster: ClusterConfig, path: Path = DEFAULT_SSH_CONFIG) -> bool:
-    """Keep the login alias but remove a stale compute-node target."""
+    """Remove a stale compute-node target while preserving managed login settings."""
     path = path.expanduser()
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     block = render_login_block(cluster)
     updated = _replace_managed_block(existing, cluster, block)
     changed = updated != existing
-    if changed or not path.exists():
+    if changed:
         _write_config(path, updated)
     return changed
